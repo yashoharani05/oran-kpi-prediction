@@ -1,0 +1,21 @@
+# .dockerignore (root level)
+# Not used directly by Docker but good to have for documentation.
+# Each service has its own .dockerignore in its own folder.
+
+# Python
+**/__pycache__/
+**/*.pyc
+**/venv/
+**/.venv/
+
+# Node.js
+**/node_modules/
+**/.next/
+
+# Git
+.git/
+.gitignore
+
+# Editor
+.vscode/
+.idea/

@@ -1,0 +1,314 @@
+# API Documentation
+
+**Base URL:** `http://localhost:8000`
+**Interactive docs:** `http://localhost:8000/docs` (Swagger UI — test everything here)
+**All responses:** JSON
+
+---
+
+## Endpoints
+
+### GET /
+
+Root health ping.
+
+**Response:**
+```json
+{
+  "project": "ML-based KPI Prediction xApp for O-RAN",
+  "status": "running",
+  "docs": "http://localhost:8000/docs"
+}
+```
+
+---
+
+### GET /api/health
+
+Check whether the server is running and which models are loaded.
+
+**Response:**
+```json
+{
+  "status": "ok",
+  "model_loaded": true,
+  "model_name": "RF + XGB + LSTM",
+  "message": "Loaded: RF=yes  XGB=yes  LSTM=yes"
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `status` | string | `"ok"` or `"error"` |
+| `model_loaded` | bool | true if at least one model is loaded |
+| `model_name` | string | names of loaded models |
+| `message` | string | per-model load status |
+
+---
+
+### POST /api/predict
+
+Run a degradation prediction on a single set of KPI values.
+
+**Query parameter:**
+
+| Parameter | Values | Default |
+|---|---|---|
+| `model` | `random_forest`, `xgboost`, `lstm` | `random_forest` |
+
+**Example:** `POST /api/predict?model=xgboost`
+
+**Request body (all 18 fields required):**
+```json
+{
+  "dl_mcs": 9.6,
+  "dl_n_samples": 147,
+  "dl_buffer_bytes": 0,
+  "tx_brate_downlink_mbps": 0.115,
+  "tx_pkts_downlink": 42,
+  "dl_cqi": 7.0,
+  "ul_mcs": 0.0,
+  "ul_n_samples": 0,
+  "ul_buffer_bytes": 0,
+  "rx_brate_uplink_mbps": 0.0,
+  "rx_pkts_uplink": 0,
+  "rx_errors_uplink_pct": 0.0,
+  "ul_sinr": 0.0,
+  "phr": 0,
+  "sum_requested_prbs": 790,
+  "sum_granted_prbs": 174,
+  "ul_turbo_iters": 0.0,
+  "prb_grant_ratio": 0.22
+}
+```
+
+**Request fields:**
+
+| Field | Type | Description |
+|---|---|---|
+| `dl_mcs` | float | Downlink Modulation and Coding Scheme (0–28). Higher = better channel. |
+| `dl_n_samples` | int | Number of downlink transmission samples in this window |
+| `dl_buffer_bytes` | int | Downlink queue backlog in bytes |
+| `tx_brate_downlink_mbps` | float | Actual downlink throughput in Mbps |
+| `tx_pkts_downlink` | int | Downlink packets sent in this window |
+| `dl_cqi` | float | Channel Quality Indicator (0–15). Lower = worse signal. |
+| `ul_mcs` | float | Uplink Modulation and Coding Scheme (0–28) |
+| `ul_n_samples` | int | Number of uplink transmission samples |
+| `ul_buffer_bytes` | int | Uplink queue backlog in bytes |
+| `rx_brate_uplink_mbps` | float | Actual uplink throughput in Mbps |
+| `rx_pkts_uplink` | int | Uplink packets received |
+| `rx_errors_uplink_pct` | float | Uplink packet error rate (0–100). Higher = worse. |
+| `ul_sinr` | float | Signal-to-Interference-plus-Noise Ratio in dB. 0 when UE is idle. |
+| `phr` | int | Power Headroom Report — remaining transmit power the UE has |
+| `sum_requested_prbs` | int | Physical Resource Blocks the UE requested |
+| `sum_granted_prbs` | int | Physical Resource Blocks the scheduler actually granted |
+| `ul_turbo_iters` | float | Average turbo decoder iterations per packet. 0 when UE is idle. |
+| `prb_grant_ratio` | float | Derived: sum_granted / (sum_requested + 1). Congestion indicator. |
+
+**Response (Normal):**
+```json
+{
+  "risk_label": "Normal",
+  "risk_code": 0,
+  "probability": 0.0,
+  "recommendation": "Network is operating normally. All KPIs are within healthy ranges. No action required.",
+  "model_used": "XGBoost"
+}
+```
+
+**Response (Degraded):**
+```json
+{
+  "risk_label": "Degraded",
+  "risk_code": 1,
+  "probability": 0.96,
+  "recommendation": "HIGH RISK: Network degradation detected with high confidence. Immediate investigation recommended.",
+  "model_used": "XGBoost"
+}
+```
+
+**Response fields:**
+
+| Field | Type | Description |
+|---|---|---|
+| `risk_label` | string | `"Normal"` or `"Degraded"` |
+| `risk_code` | int | `0` (Normal) or `1` (Degraded) |
+| `probability` | float | Model confidence that network IS degraded (0.0–1.0) |
+| `recommendation` | string | Plain-English action advice based on risk level and confidence |
+| `model_used` | string | Which model produced this prediction |
+
+**Recommendation text levels:**
+
+| Condition | Text |
+|---|---|
+| Normal + probability < 0.20 | "No action required" |
+| Normal + probability 0.20–1.0 | "Continue monitoring" |
+| Degraded + probability 0.50–0.60 | "LOW RISK: Marginal degradation" |
+| Degraded + probability 0.60–0.85 | "MODERATE RISK: Review KPI trends" |
+| Degraded + probability ≥ 0.85 | "HIGH RISK: Immediate investigation" |
+
+**Error codes:**
+
+| Code | Cause | Fix |
+|---|---|---|
+| 400 | Unknown model name in ?model= parameter | Use `random_forest`, `xgboost`, or `lstm` |
+| 422 | Missing or wrong-type field in request body | Check all 18 fields are present with correct types |
+| 503 | Requested model not loaded | Run the training script for that model |
+| 500 | Unexpected prediction error | Check server logs |
+
+---
+
+### GET /api/comparison
+
+Returns the saved `comparison_report.json` containing training metrics for all three models.
+Generated by `train_xgboost.py` and updated by `train_lstm.py`.
+
+**Response:**
+```json
+{
+  "models": [
+    {
+      "model": "Random Forest",
+      "accuracy": 0.9856,
+      "precision": 1.0,
+      "recall": 0.9487,
+      "f1_score": 0.9737,
+      "tn": 301, "fp": 0, "fn": 6, "tp": 111
+    },
+    {
+      "model": "XGBoost",
+      "accuracy": 0.9952,
+      "precision": 1.0,
+      "recall": 0.9829,
+      "f1_score": 0.9914,
+      "tn": 301, "fp": 0, "fn": 2, "tp": 115
+    },
+    {
+      "model": "LSTM",
+      "accuracy": 0.7727,
+      "precision": 1.0,
+      "recall": 0.188,
+      "f1_score": 0.3165,
+      "tn": 301, "fp": 0, "fn": 95, "tp": 22,
+      "window_size": 20
+    }
+  ]
+}
+```
+
+> Note: These values are from the original single-file dataset (2,090 rows).
+> After retraining with your multi-file dataset (19M+ rows), values will differ.
+
+---
+
+### GET /api/stream/next
+
+Returns the next row from the labeled CSV dataset, runs the model on it, and advances the cursor by 1. The cursor wraps back to 0 after the final row.
+
+**Response:**
+```json
+{
+  "row_index": 42,
+  "timestamp": "2021-03-30 02:15:42.227",
+  "total_rows": 19053569,
+  "dl_mcs": 9.63,
+  "dl_cqi": 7.0,
+  "rx_errors_uplink_pct": 0.0,
+  "...": "(all 18 KPI fields included)",
+  "actual_risk": 0,
+  "predicted_risk": 0,
+  "risk_label": "Normal",
+  "probability": 0.23,
+  "recommendation": "Network is operating normally..."
+}
+```
+
+| Field | Description |
+|---|---|
+| `row_index` | Current cursor position (0-based) |
+| `total_rows` | Total rows in labeled_dataset.csv (reflects your actual dataset size) |
+| `actual_risk` | Ground truth label assigned by `label_dataset.py` |
+| `predicted_risk` | Model's live prediction for this row |
+| `probability` | Confidence that the network is degraded (0.0–1.0) |
+
+---
+
+### GET /api/stream/status
+
+Returns the current cursor position without advancing it.
+
+```json
+{
+  "cursor": 42,
+  "total_rows": 19053569,
+  "loaded": true,
+  "progress_pct": 0.0
+}
+```
+
+---
+
+### GET /api/stream/reset
+
+Rewinds the cursor to row 0.
+
+```json
+{
+  "message": "Stream reset to row 0.",
+  "cursor": 0
+}
+```
+
+---
+
+## Testing with Swagger UI
+
+1. Open `http://localhost:8000/docs`
+2. Click any endpoint to expand it
+3. Click **Try it out**
+4. The example payload is pre-filled — edit values if needed
+5. Click **Execute**
+6. The response appears below
+
+This is the easiest way to test all endpoints without writing any code.
+
+---
+
+## Testing with PowerShell (Windows)
+
+```powershell
+# Health check
+curl http://localhost:8000/api/health
+
+# Prediction with XGBoost
+$body = @{
+  dl_mcs=9.6; dl_n_samples=147; dl_buffer_bytes=0
+  tx_brate_downlink_mbps=0.115; tx_pkts_downlink=42; dl_cqi=7.0
+  ul_mcs=0.0; ul_n_samples=0; ul_buffer_bytes=0
+  rx_brate_uplink_mbps=0.0; rx_pkts_uplink=0; rx_errors_uplink_pct=0.0
+  ul_sinr=0.0; phr=0; sum_requested_prbs=790; sum_granted_prbs=174
+  ul_turbo_iters=0.0; prb_grant_ratio=0.22
+} | ConvertTo-Json
+
+Invoke-WebRequest -Uri "http://localhost:8000/api/predict?model=xgboost" `
+  -Method POST -ContentType "application/json" -Body $body
+
+# Degraded prediction test
+$degraded = @{
+  dl_mcs=0.18; dl_n_samples=22; dl_buffer_bytes=0
+  tx_brate_downlink_mbps=0.003; tx_pkts_downlink=6; dl_cqi=4.5
+  ul_mcs=11.57; ul_n_samples=14; ul_buffer_bytes=0
+  rx_brate_uplink_mbps=0.1; rx_pkts_uplink=4; rx_errors_uplink_pct=100.0
+  ul_sinr=0.81; phr=0; sum_requested_prbs=56; sum_granted_prbs=28
+  ul_turbo_iters=9.0; prb_grant_ratio=0.49
+} | ConvertTo-Json
+
+Invoke-WebRequest -Uri "http://localhost:8000/api/predict?model=xgboost" `
+  -Method POST -ContentType "application/json" -Body $degraded
+
+# Stream endpoints
+curl http://localhost:8000/api/stream/next
+curl http://localhost:8000/api/stream/status
+curl http://localhost:8000/api/stream/reset
+curl http://localhost:8000/api/comparison
+```

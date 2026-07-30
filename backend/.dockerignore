@@ -1,0 +1,47 @@
+# backend/.dockerignore
+#
+# Files and folders that should NOT be copied into the Docker image.
+# Same idea as .gitignore — keeps the image clean and small.
+
+# Python virtual environment (huge, not needed — Docker installs deps from requirements.txt)
+venv/
+.venv/
+env/
+
+# Python bytecode cache (auto-generated, not needed)
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Development tools
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Git
+.git/
+.gitignore
+
+# Documentation
+*.md
+README*
+
+# The raw CSV is large and mounted via volume — not baked into the image
+# (see docker-compose.yml volumes section)
+data/raw/
+
+# Jupyter notebooks
+*.ipynb
+notebooks/

@@ -1,0 +1,67 @@
+/*
+  globals.css
+  Global stylesheet. Tailwind directives + base custom properties.
+  JetBrains Mono is imported for all monospaced metric values.
+*/
+
+@import url("https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap");
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  /* Core palette */
+  --bg-base: #0f172a;
+  --bg-panel: #1e293b;
+  --bg-panel2: #263348;
+  --border: #334155;
+  --text-muted: #64748b;
+
+  /* Status colours */
+  --normal: #22c55e;
+  --degraded: #ef4444;
+  --warning: #f59e0b;
+  --accent: #38bdf8;
+}
+
+body {
+  background-color: var(--bg-base);
+  color: #e2e8f0;
+  font-family: "Inter", ui-sans-serif, system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Monospace class used on every KPI value */
+.font-mono {
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+}
+
+/* Gauge stroke animation */
+@keyframes gauge-fill {
+  from {
+    stroke-dashoffset: 339;
+  }
+  to {
+    stroke-dashoffset: var(--target-offset);
+  }
+}
+
+.gauge-arc {
+  animation: gauge-fill 0.9s cubic-bezier(0.4, 0, 0.2, 1) forwards;
+}
+
+/* Subtle pulse on degraded alert */
+@keyframes pulse-border {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(239, 68, 68, 0);
+  }
+  50% {
+    box-shadow: 0 0 0 6px rgba(239, 68, 68, 0.18);
+  }
+}
+
+.alert-degraded {
+  animation: pulse-border 2s ease-in-out infinite;
+}

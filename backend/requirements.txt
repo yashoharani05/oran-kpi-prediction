@@ -1,0 +1,27 @@
+# ============================================================
+# requirements.txt
+# Backend dependencies for the FYP O-RAN KPI Prediction xApp
+# Install with: pip install -r requirements.txt
+# ============================================================
+
+# --- Web Framework ---
+fastapi==0.111.0          # FastAPI web framework for building the REST API
+uvicorn==0.29.0           # ASGI server to run FastAPI
+python-multipart==0.0.9   # Required by FastAPI to handle file uploads
+
+# --- Data Processing ---
+pandas==2.2.2             # Data manipulation and CSV handling
+numpy==1.26.4             # Numerical computing (used by pandas and sklearn)
+
+# --- Machine Learning ---
+scikit-learn==1.4.2       # Random Forest and other classic ML algorithms
+xgboost==2.0.3            # XGBoost classifier
+
+# --- Deep Learning (LSTM) ---
+tensorflow==2.16.1        # TensorFlow includes Keras for building LSTM models
+
+# --- Utilities ---
+joblib==1.4.2             # Saving and loading scikit-learn models (.pkl files)
+matplotlib==3.9.0         # Plotting (for generating charts in backend if needed)
+seaborn==0.13.2           # Statistical plots (confusion matrix, etc.)
+pydantic==2.7.1           # Data validation (used by FastAPI for request/response models)

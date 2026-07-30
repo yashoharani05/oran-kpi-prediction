@@ -1,0 +1,138 @@
+# =============================================================================
+# docker-compose.yml
+#
+# Defines the two services that make up this project:
+#   backend  — FastAPI + ML models (Python)
+#   frontend — Next.js dashboard (Node.js)
+#
+# WHAT IS DOCKER COMPOSE?
+#   docker-compose.yml is a recipe for running multiple containers together.
+#   Instead of starting each container manually with long docker run commands,
+#   you run ONE command and Docker starts everything automatically:
+#     docker compose up --build
+#
+# HOW THE SERVICES TALK TO EACH OTHER:
+#   Docker creates a private network called "oran-network".
+#   Inside that network, services find each other by NAME (not localhost).
+#   The frontend reaches the backend at http://backend:8000 — not localhost:8000.
+#   This is why next.config.js uses NEXT_PUBLIC_BACKEND_URL=http://backend:8000.
+# =============================================================================
+
+services:
+
+  # --------------------------------------------------------------------------
+  # BACKEND SERVICE
+  # --------------------------------------------------------------------------
+  backend:
+    # Build the image using backend/Dockerfile
+    build:
+      context: ./backend    # Docker copies files from this folder
+      dockerfile: Dockerfile
+
+    # Name shown in docker compose logs
+    container_name: oran-backend
+
+    # Map container port 8000 to host port 8000.
+    # Format: "host_port:container_port"
+    # After this, your browser can reach the API at http://localhost:8000
+    ports:
+      - "8000:8000"
+
+    # -----------------------------------------------------------------------
+    # VOLUMES — shared folders between host and container.
+    #
+    # These let the container read your local files without baking them
+    # into the image. Important for:
+    #   - The raw CSV: you place it on your PC, the container reads it
+    #   - The trained models: training runs INSIDE the container,
+    #     saves .pkl/.keras files, and they appear on your PC too
+    # -----------------------------------------------------------------------
+    volumes:
+      # Mount the raw data folder (read-only — container should not modify)
+      - ./backend/data/raw:/app/data/raw:ro
+
+      # Mount the processed data folder (read-write — container writes clean CSVs)
+      - ./backend/data/processed:/app/data/processed
+
+      # Mount the models folder (read-write — container writes trained models)
+      - ./backend/models:/app/models
+
+    # -----------------------------------------------------------------------
+    # ENVIRONMENT VARIABLES passed into the container at runtime.
+    # These override any defaults set in the Dockerfile.
+    # -----------------------------------------------------------------------
+    environment:
+      - TF_CPP_MIN_LOG_LEVEL=3        # suppress TensorFlow startup messages
+      - PYTHONUNBUFFERED=1            # print Python output immediately (no buffering)
+
+    # -----------------------------------------------------------------------
+    # HEALTHCHECK — Docker periodically calls this to check if the service is up.
+    # The frontend uses "depends_on: backend: condition: service_healthy"
+    # to wait until the backend is actually ready before starting.
+    #
+    # interval: check every 10 seconds
+    # timeout:  give up if no response in 5 seconds
+    # retries:  mark unhealthy after 5 failed checks
+    # start_period: give the backend 30 seconds to start before checking
+    #               (TF loading takes time on first boot)
+    # -----------------------------------------------------------------------
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+    networks:
+      - oran-network
+
+    # Restart automatically if the container crashes (but not if you stop it)
+    restart: unless-stopped
+
+
+  # --------------------------------------------------------------------------
+  # FRONTEND SERVICE
+  # --------------------------------------------------------------------------
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+
+    container_name: oran-frontend
+
+    ports:
+      - "3000:3000"
+
+    # -----------------------------------------------------------------------
+    # depends_on with condition: service_healthy
+    #
+    # This tells Docker Compose: "Don't start the frontend until the backend
+    # healthcheck passes." Without this, the frontend might start before the
+    # backend is ready and show "Model Offline" in the header.
+    # -----------------------------------------------------------------------
+    depends_on:
+      backend:
+        condition: service_healthy
+
+    environment:
+      # Tell Next.js where the backend is.
+      # "backend" is the service name — Docker resolves it to the backend container's IP.
+      - NEXT_PUBLIC_BACKEND_URL=http://backend:8000
+      - NODE_ENV=production
+
+    networks:
+      - oran-network
+
+    restart: unless-stopped
+
+
+# ----------------------------------------------------------------------------
+# NETWORK
+# Docker creates an isolated network named "oran-network".
+# Both services join it, so they can reach each other by service name.
+# "bridge" is the standard network driver for single-host Docker setups.
+# ----------------------------------------------------------------------------
+networks:
+  oran-network:
+    driver: bridge
