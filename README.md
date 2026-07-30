@@ -1,6 +1,6 @@
 # ML-based KPI Prediction xApp for O-RAN Network Monitoring
 
-**Final Year Project — BSc Software Engineering**
+**Final Year Project — BSc Electronics and Telecommunication Engineering**
 **Dataset:** Real O-RAN testbed measurements (srsRAN) — 2,090 rows, 8.7 minutes
 
 ---
