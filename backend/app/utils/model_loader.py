@@ -1,15 +1,20 @@
 # =============================================================================
 # app/utils/model_loader.py
 # Loads Random Forest, XGBoost, and LSTM models at startup.
+#
+# METHODOLOGY NOTE: these paths point at the "_forecast_5s" model artefacts
+# produced by the corrected training scripts — each predicts degradation
+# ~5 seconds AHEAD of the input KPIs, not the same-instant state. See
+# docs/FORECASTING_METHODOLOGY_UPDATE.md.
 # =============================================================================
 
 import os
 import joblib
 
-RF_MODEL_PATH   = os.path.join("models", "random_forest_model.pkl")
-XGB_MODEL_PATH  = os.path.join("models", "xgboost_model.pkl")
-LSTM_MODEL_PATH = os.path.join("models", "lstm_model.keras")
-LSTM_SCALER_PATH= os.path.join("models", "lstm_scaler.pkl")
+RF_MODEL_PATH   = os.path.join("models", "random_forest_forecast_5s.pkl")
+XGB_MODEL_PATH  = os.path.join("models", "xgboost_forecast_5s.pkl")
+LSTM_MODEL_PATH = os.path.join("models", "lstm_forecast_5s.keras")
+LSTM_SCALER_PATH= os.path.join("models", "lstm_scaler_forecast_5s.pkl")
 
 
 def load_model(path, name):

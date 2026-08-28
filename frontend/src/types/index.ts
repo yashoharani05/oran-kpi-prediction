@@ -32,6 +32,13 @@ export interface PredictionResult {
   probability: number;
   recommendation: string;
   model_used: string;
+  // --- Added by the forecasting correction (additive, optional) ---
+  // risk_label/risk_code/probability now describe the FORECAST state
+  // ~forecast_horizon_seconds ahead, not the same-instant state.
+  current_status?: "Normal" | "Degraded" | null;
+  current_score?: number | null;
+  forecast_horizon_seconds?: number;
+  early_warning?: boolean;
 }
 
 // Simple status enum for async API calls

@@ -4,7 +4,14 @@
 # Endpoints:
 #   GET  /api/health      — status of all three models
 #   POST /api/predict     — single prediction (?model=random_forest|xgboost|lstm)
-#   GET  /api/comparison  — saved three-way metrics JSON
+#   GET  /api/comparison  — saved metrics JSON (naive baseline + all 3 models)
+#
+# METHODOLOGY NOTE (forecasting correction):
+# The three ML models loaded here now forecast degradation
+# FORECAST_HORIZON_SECONDS ahead of the submitted KPIs, not the same instant.
+# 'current_status' in the response is computed separately by the
+# deterministic rule (app/utils/degradation_rule.py), never by these models.
+# See docs/FORECASTING_METHODOLOGY_UPDATE.md.
 # =============================================================================
 
 import json
@@ -14,11 +21,13 @@ import pandas as pd
 from fastapi import APIRouter, Request, HTTPException, Query
 from app.schemas import KpiInput, PredictionResponse, HealthResponse
 from app.utils.recommender import get_recommendation
+from app.utils.degradation_rule import current_status as compute_current_status
+from app.ml.forecast_config import FORECAST_HORIZON_SECONDS, FORECAST_ALERT_THRESHOLD
 
 router = APIRouter()
 
 COMPARISON_PATH = os.path.join("models", "comparison_report.json")
-WINDOW_SIZE     = 20   # must match train_lstm.py
+WINDOW_SIZE     = 20   # must match train_lstm.py's LSTM_WINDOW_SIZE
 
 FEATURE_COLS = [
     "dl_mcs", "dl_n_samples", "dl_buffer_bytes", "tx_brate_downlink_mbps",
@@ -119,12 +128,30 @@ def predict(
         except Exception as e:
             raise HTTPException(500, detail=f"Prediction failed: {e}")
 
+    # ----------------------------------------------------------------
+    # Current status: computed with the DETERMINISTIC rule (same logic as
+    # label_dataset.py), independent of the ML forecast model — per section
+    # 23 of the correction brief. This never uses the forecasting model.
+    # ----------------------------------------------------------------
+    kpi_dict = {col: getattr(kpi_input, col) for col in FEATURE_COLS}
+    status_label, status_score = compute_current_status(kpi_dict)
+
+    early_warning = (
+        status_label == "Normal"
+        and risk_code == 1
+        and probability >= FORECAST_ALERT_THRESHOLD
+    )
+
     return PredictionResponse(
         risk_label     = "Degraded" if risk_code == 1 else "Normal",
         risk_code      = risk_code,
         probability    = round(probability, 4),
         recommendation = get_recommendation(risk_code, probability),
         model_used     = MODEL_DISPLAY[model],
+        current_status = status_label,
+        current_score  = status_score,
+        forecast_horizon_seconds = FORECAST_HORIZON_SECONDS,
+        early_warning  = early_warning,
     )
 
 

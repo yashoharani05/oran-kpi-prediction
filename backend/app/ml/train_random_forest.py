@@ -2,7 +2,8 @@
 # train_random_forest.py
 #
 # PURPOSE:
-#   Train a Random Forest classifier to predict network degradation risk
+#   Train a Random Forest classifier to forecast network degradation
+#   approximately 5 SECONDS AHEAD (see docs/FORECASTING_METHODOLOGY_UPDATE.md),
 #   using the labeled O-RAN KPI dataset produced in Phase 1.
 #
 # HOW TO RUN (from the backend/ folder with venv active):
@@ -12,7 +13,8 @@
 #   backend/data/processed/labeled_dataset.csv
 #
 # OUTPUT:
-#   backend/models/random_forest_model.pkl   ← saved trained model
+#   backend/models/random_forest_forecast_5s.pkl   ← saved trained model
+#   backend/models/comparison_report.json          ← naive baseline + RF entries
 #
 # WHAT IS A RANDOM FOREST?
 #   A Random Forest builds many Decision Trees, each trained on a slightly
@@ -27,6 +29,17 @@ import joblib
 import numpy as np
 import pandas as pd
 
+# Enable pandas Copy-on-Write mode. Without this, pandas <3.0 defaults to
+# eagerly DEEP-COPYING the entire DataFrame inside routine calls like
+# rename()/drop()/set_index() (see pandas.core.generic._rename's internal
+# `self.copy(deep=copy and not using_copy_on_write())`). On a small sample
+# dataset that's invisible; on a real O-RAN recording with tens of millions
+# of rows, EVERY such call briefly allocates a full extra multi-GB copy and
+# can crash with numpy.core._exceptions._ArrayMemoryError. Copy-on-Write
+# makes these operations cheap (share memory until an actual write happens)
+# without changing any pipeline behaviour.
+pd.set_option("mode.copy_on_write", True)
+
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
@@ -38,13 +51,28 @@ from sklearn.metrics import (
     classification_report,
 )
 
+from forecast_config import (
+    NON_FEATURE_COLS, CURRENT_LABEL_COL, FUTURE_LABEL_COL,
+    FORECAST_HORIZON_SECONDS,
+)
+from forecast_utils import (
+    naive_baseline_metrics, transition_report, upsert_comparison_report,
+    downcast_numeric_dtypes,
+)
+
 # =============================================================================
 # CONFIGURATION
 # All file paths and model settings are defined here in one place.
 # =============================================================================
 
 LABELED_DATA_PATH = os.path.join("data", "processed", "labeled_dataset.csv")
-MODEL_SAVE_PATH   = os.path.join("models", "random_forest_model.pkl")
+# Renamed from random_forest_model.pkl: this model now predicts the FUTURE
+# forecasting target (degradation_risk_future), not the same-instant one —
+# see docs/FORECASTING_METHODOLOGY_UPDATE.md. Kept as a distinct filename
+# (section 28 of the correction brief) so the old same-instant model is not
+# silently overwritten; app/utils/model_loader.py points at this new path.
+MODEL_SAVE_PATH   = os.path.join("models", "random_forest_forecast_5s.pkl")
+COMPARISON_REPORT_PATH = os.path.join("models", "comparison_report.json")
 
 # --- Random Forest hyperparameters ---
 # These are the "settings" that control how the model is built.
@@ -85,6 +113,10 @@ def load_data(path):
 
     df = pd.read_csv(path, index_col="timestamp", parse_dates=True)
 
+    # Re-downcast — pandas.read_csv re-infers float64/int64 from the CSV
+    # text regardless of what dtypes were used when it was written.
+    df = downcast_numeric_dtypes(df)
+
     print(f"  File:   {path}")
     print(f"  Rows:   {df.shape[0]}")
     print(f"  Cols:   {df.shape[1]}")
@@ -100,25 +132,31 @@ def prepare_features_and_label(df):
     """
     Split the DataFrame into:
       X — the input features the model will learn from (18 columns)
-      y — the target label the model will predict (degradation_risk)
+      y — the target label the model will predict:
+          'degradation_risk_future' — degradation state ~5 SECONDS AHEAD,
+          NOT the same-instant 'degradation_risk'.
 
-    We also drop 'degradation_score' from X because:
-      - It was used to CREATE the label, so including it would be cheating.
-      - The model would learn "if score >= 2, predict 1" which tells us nothing
-        about whether the raw KPI features are predictive.
+    We drop from X:
+      - 'degradation_score'         — the intermediate score used to BUILD the label (cheating if included)
+      - 'degradation_risk'          — the CURRENT-instant label ("label_now"). This is deliberately
+                                       excluded from the forecasting model's inputs per the correction
+                                       brief (section 9) — the main experiment predicts the future purely
+                                       from the raw KPI features, not from a rule-based summary of "now".
+      - 'degradation_risk_future'   — the target itself
+      - 'session_id'                — recording/session metadata, not a radio-performance feature
 
     In machine learning, X is called the "feature matrix" and y is the
     "target vector". This split is standard for all supervised learning.
     """
     print_section("STEP 2 — Preparing features (X) and label (y)")
 
-    # Drop both label-related columns from features
-    # 'degradation_score' is the intermediate score we used to BUILD the label
-    # 'degradation_risk'  is the label itself — what we want to predict
-    COLUMNS_TO_EXCLUDE = ["degradation_score", "degradation_risk"]
+    print(f"\n  Target column: '{FUTURE_LABEL_COL}' "
+          f"(degradation state ~{FORECAST_HORIZON_SECONDS}s ahead of each row's KPIs)")
+
+    COLUMNS_TO_EXCLUDE = [c for c in NON_FEATURE_COLS if c in df.columns]
 
     X = df.drop(columns=COLUMNS_TO_EXCLUDE)
-    y = df["degradation_risk"]
+    y = df[FUTURE_LABEL_COL]
 
     print(f"\n  Feature matrix X: {X.shape[0]} rows × {X.shape[1]} features")
     print(f"\n  Features used:")
@@ -235,26 +273,44 @@ def train_model(X_train, y_train):
     """
     print_section("STEP 4 — Training the Random Forest model")
 
+    # SCALE SAFETY: max_depth=None (unlimited) is fine on a small dataset —
+    # trees stay shallow because there isn't much data to split on. On a
+    # real O-RAN recording with tens of millions of rows, unlimited-depth
+    # trees can grow enormous (each split node consumes memory, and depth
+    # scales with training-set size), risking exactly the kind of
+    # memory/runtime blowup this fix is meant to prevent. Rather than
+    # silently changing MAX_DEPTH itself, we only cap it at fit time, and
+    # only when the training set is large enough for "unlimited" to be a
+    # real risk — small-dataset behaviour (and any explicit MAX_DEPTH
+    # override) is unchanged.
+    LARGE_TRAINING_SET_THRESHOLD = 500_000
+    effective_max_depth = MAX_DEPTH
+    if MAX_DEPTH is None and len(X_train) > LARGE_TRAINING_SET_THRESHOLD:
+        effective_max_depth = 25
+        print(f"\n  ⚠ Training set has {len(X_train):,} rows — capping max_depth "
+              f"at {effective_max_depth} (was None/unlimited) to keep memory and "
+              f"training time bounded. Override MAX_DEPTH explicitly above to "
+              f"control this directly.")
+
     print(f"\n  Model settings:")
     print(f"    n_estimators  = {N_ESTIMATORS}   (number of trees)")
-    print(f"    max_depth     = {MAX_DEPTH}  (None = unlimited depth)")
+    print(f"    max_depth     = {effective_max_depth}  (None = unlimited depth)")
     print(f"    class_weight  = '{CLASS_WEIGHT}'  (handles class imbalance)")
     print(f"    random_state  = {RANDOM_STATE}   (for reproducibility)")
 
     # Create the model object with our chosen settings
     model = RandomForestClassifier(
         n_estimators=N_ESTIMATORS,
-        max_depth=MAX_DEPTH,
+        max_depth=effective_max_depth,
         class_weight=CLASS_WEIGHT,
         random_state=RANDOM_STATE,
         n_jobs=-1,   # Use all available CPU cores to train faster
     )
 
     print(f"\n  Training on {X_train.shape[0]} rows × {X_train.shape[1]} features...")
-    print("  (This may take a few seconds...)")
+    print("  (This may take a while on a large dataset...)")
 
     # .fit() is where learning actually happens.
-    # The model reads all 1,672 training rows and builds 100 decision trees.
     model.fit(X_train, y_train)
 
     print("  ✓ Training complete.")
@@ -469,11 +525,31 @@ def main():
     # Step 3 — Split into train and test sets
     X_train, X_test, y_train, y_test = split_data(X, y)
 
+    # Step 3b — Naive baseline on the SAME test split: "assume state unchanged"
+    # (must be evaluated on held-out data too, or it isn't a fair comparison)
+    print_section("STEP 3b — Naive baseline on the held-out test set")
+    # IMPORTANT: use POSITIONAL alignment (iloc), not X_test.index (loc).
+    # With real multi-session data, 'timestamp' is NOT guaranteed unique —
+    # multiple recording files can easily share timestamp values (e.g. if
+    # each session's clock is relative to its own start). df.loc[X_test.index]
+    # would then match EVERY row sharing each duplicate timestamp, silently
+    # returning far more rows than X_test actually has. Since split_data()
+    # uses shuffle=False, X_test is exactly df's last len(y_test) rows in
+    # original order — iloc on that same positional boundary is always
+    # correct regardless of whether the index has duplicates.
+    current_test = df[CURRENT_LABEL_COL].iloc[len(y_train):]
+    baseline_metrics = naive_baseline_metrics(current_test, y_test)
+    transition_report(current_test, y_test, predicted_future=current_test)
+
     # Step 4 — Train the Random Forest
     model = train_model(X_train, y_train)
 
     # Step 5 — Evaluate on the test set
     metrics = evaluate_model(model, X_test, y_test)
+    metrics["model"] = "Random Forest (5s forecast)"
+    print_section("STEP 5b — Transition analysis for Random Forest")
+    rf_test_pred = model.predict(X_test)
+    transition_report(current_test, y_test, predicted_future=rf_test_pred)
 
     # Step 6 — Show which features mattered most
     print_feature_importances(model, list(X.columns))
@@ -481,11 +557,15 @@ def main():
     # Step 7 — Save the trained model
     save_model(model, MODEL_SAVE_PATH)
 
+    # Step 8 — Record both entries in the shared comparison report
+    upsert_comparison_report(COMPARISON_REPORT_PATH, baseline_metrics)
+    upsert_comparison_report(COMPARISON_REPORT_PATH, metrics)
+
     # Final summary
     print("\n" + "=" * 65)
-    print("  ✓ Random Forest training complete!")
-    print(f"  F1 Score : {metrics['f1_score']}")
-    print(f"  Accuracy : {metrics['accuracy']}")
+    print("  ✓ Random Forest (5s forecast) training complete!")
+    print(f"  F1 Score : {metrics['f1_score']}  (baseline: {baseline_metrics['f1_score']})")
+    print(f"  Accuracy : {metrics['accuracy']}  (baseline: {baseline_metrics['accuracy']})")
     print(f"  Model saved to: {MODEL_SAVE_PATH}")
     print("  Next step: Phase 2b — Train XGBoost classifier.")
     print("=" * 65 + "\n")

@@ -53,6 +53,10 @@ function toPredictionResult(row: StreamRow): PredictionResult {
     probability: row.probability,
     recommendation: row.recommendation,
     model_used: "Random Forest",
+    current_status: row.current_status ?? undefined,
+    current_score: row.current_score ?? undefined,
+    forecast_horizon_seconds: row.forecast_horizon_seconds ?? 5,
+    early_warning: row.early_warning ?? false,
   };
 }
 
@@ -406,15 +410,18 @@ export default function LiveMonitorPage() {
                 {/* Alert box */}
                 <AlertBox result={prediction} />
 
-                {/* Ground truth comparison */}
+                {/* Ground truth comparison — forecast vs the FUTURE ground truth,
+                    since predicted_risk is now a ~5s-ahead forecast, not the
+                    same-instant label. actual_risk (current) is shown too for
+                    context but is no longer what accuracy is measured against. */}
                 {currentRow && (
                   <div className="bg-[#1e293b] border border-slate-700/50 rounded-xl p-4">
                     <p className="text-[10px] font-semibold text-slate-500 uppercase tracking-widest mb-3">
-                      Ground Truth vs Prediction
+                      Ground Truth vs Forecast ({currentRow.forecast_horizon_seconds ?? 5}s ahead)
                     </p>
                     <div className="grid grid-cols-2 gap-3 text-xs font-mono">
                       <div className="flex flex-col gap-0.5">
-                        <span className="text-slate-600">Actual label</span>
+                        <span className="text-slate-600">Actual label (now)</span>
                         <span
                           className={
                             currentRow.actual_risk === 0
@@ -426,7 +433,29 @@ export default function LiveMonitorPage() {
                         </span>
                       </div>
                       <div className="flex flex-col gap-0.5">
-                        <span className="text-slate-600">Predicted</span>
+                        <span className="text-slate-600">
+                          Actual label (+{currentRow.forecast_horizon_seconds ?? 5}s)
+                        </span>
+                        <span
+                          className={
+                            currentRow.actual_future_risk == null
+                              ? "text-slate-600"
+                              : currentRow.actual_future_risk === 0
+                              ? "text-green-400"
+                              : "text-red-400"
+                          }
+                        >
+                          {currentRow.actual_future_risk == null
+                            ? "n/a"
+                            : currentRow.actual_future_risk === 0
+                            ? "Normal"
+                            : "Degraded"}
+                        </span>
+                      </div>
+                      <div className="flex flex-col gap-0.5">
+                        <span className="text-slate-600">
+                          Forecast (+{currentRow.forecast_horizon_seconds ?? 5}s)
+                        </span>
                         <span
                           className={
                             currentRow.predicted_risk === 0
@@ -439,17 +468,21 @@ export default function LiveMonitorPage() {
                             : "Degraded"}
                         </span>
                       </div>
-                      <div className="col-span-2 flex flex-col gap-0.5 border-t border-slate-700 pt-2 mt-1">
+                      <div className="flex flex-col gap-0.5 border-t border-slate-700 pt-2 mt-1">
                         <span className="text-slate-600">Match?</span>
                         <span
                           className={
-                            currentRow.actual_risk === currentRow.predicted_risk
+                            currentRow.actual_future_risk == null
+                              ? "text-slate-600"
+                              : currentRow.actual_future_risk === currentRow.predicted_risk
                               ? "text-green-400"
                               : "text-amber-400"
                           }
                         >
-                          {currentRow.actual_risk === currentRow.predicted_risk
-                            ? "✓ Correct prediction"
+                          {currentRow.actual_future_risk == null
+                            ? "n/a"
+                            : currentRow.actual_future_risk === currentRow.predicted_risk
+                            ? "✓ Correct forecast"
                             : "✗ Mismatch"}
                         </span>
                       </div>

@@ -1,19 +1,32 @@
 # ML-based KPI Prediction xApp for O-RAN Network Monitoring
 
-**Final Year Project — BSc Electronics and Telecommunication Engineering**
+**Final Year Project — BSc Electronics and Telecommunications Engineering**
 **Dataset:** Real O-RAN testbed measurements (srsRAN) — 2,090 rows, 8.7 minutes
 
 ---
 
 ## What This Project Does
 
-Predicts 5G radio network degradation from Key Performance Indicators (KPIs) in real time, using three machine learning models trained on real testbed data.
+Forecasts 5G radio network degradation **~5 seconds ahead** from Key
+Performance Indicators (KPIs), using three machine learning models trained
+on real testbed data. The model sees KPIs at time `t` and predicts the
+network's degradation state at `t + 5s` — not the same instant — so the
+xApp can raise an early warning before conditions actually degrade.
 
-| Model | F1 Score | Missed degradation events |
-|---|---|---|
-| Random Forest | 97.37% | 6 of 117 |
-| XGBoost | 99.14% | 2 of 117 |
-| LSTM | 31.65% | 95 of 117 (short dataset — expected) |
+> See `docs/FORECASTING_METHODOLOGY_UPDATE.md` for the full rationale: this
+> project originally trained on same-instant labels (predicting "now" from
+> "now", which is classification, not forecasting) and was corrected to
+> predict 5 seconds ahead, evaluated against a naive "nothing changes"
+> baseline. Re-run the training pipeline below to get current F1/accuracy
+> numbers for the forecasting task — the old same-instant numbers no longer
+> apply and have been removed from this table.
+
+| Model | Task |
+|---|---|
+| Random Forest | Forecast degradation ~5s ahead |
+| XGBoost | Forecast degradation ~5s ahead |
+| LSTM | Forecast degradation ~5s ahead (20-row sliding window) |
+| Naive Baseline | "Assume state stays the same" — the bar the ML models must beat |
 
 ---
 
@@ -143,3 +156,12 @@ fyp-oran-kpi-prediction/
 | `docs/FUTURE_IMPROVEMENTS.md` | 12 concrete next steps |
 | `docs/PRESENTATION_NOTES.md` | 7-slide structure + talking points |
 | `docs/VIVA_QA.md` | 25 viva questions with full answers |
+| `docs/FORECASTING_METHODOLOGY_UPDATE.md` | **Read this first** — the same-instant → forecasting correction: what changed, why, and what still needs re-running |
+
+> Note: `ARCHITECTURE.md`, `API_DOCS.md`, `USER_GUIDE.md`, `DEVELOPER_GUIDE.md`,
+> `TESTING_GUIDE.md`, `LIMITATIONS.md`, `FUTURE_IMPROVEMENTS.md`,
+> `PRESENTATION_NOTES.md`, and `VIVA_QA.md` were written for the original
+> same-instant version of this project and have not yet been updated for the
+> forecasting correction (old model filenames, old F1 numbers, no mention of
+> `current_status`/forecasting). `FORECASTING_METHODOLOGY_UPDATE.md` is the
+> current source of truth until they're refreshed.
