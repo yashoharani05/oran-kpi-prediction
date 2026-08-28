@@ -2,16 +2,17 @@
 # train_lstm.py
 #
 # PURPOSE:
-#   Train an LSTM neural network to predict network degradation using the
-#   last 20 KPI readings as context (sliding window over time).
+#   Train an LSTM neural network to FORECAST network degradation ~5 seconds
+#   ahead (see docs/FORECASTING_METHODOLOGY_UPDATE.md), using the last 20 KPI
+#   readings as context (sliding window over time).
 #
 # HOW TO RUN (from the backend/ folder with venv active):
 #   python app/ml/train_lstm.py
 #
 # INPUT:  backend/data/processed/labeled_dataset.csv
-# OUTPUT: backend/models/lstm_model.keras
-#         backend/models/lstm_scaler.pkl
-#         backend/models/comparison_report.json  (updated with all 3 models)
+# OUTPUT: backend/models/lstm_forecast_5s.keras
+#         backend/models/lstm_scaler_forecast_5s.pkl
+#         backend/models/comparison_report.json  (updated with all entries)
 #
 # WHY THIS VERSION IS DIFFERENT FROM THE ORIGINAL:
 #   The original script tried to build ALL sliding-window sequences at once,
@@ -38,6 +39,17 @@ import math
 import numpy as np
 import pandas as pd
 
+# Enable pandas Copy-on-Write mode. Without this, pandas <3.0 defaults to
+# eagerly DEEP-COPYING the entire DataFrame inside routine calls like
+# rename()/drop()/set_index() (see pandas.core.generic._rename's internal
+# `self.copy(deep=copy and not using_copy_on_write())`). On a small sample
+# dataset that's invisible; on a real O-RAN recording with tens of millions
+# of rows, EVERY such call briefly allocates a full extra multi-GB copy and
+# can crash with numpy.core._exceptions._ArrayMemoryError. Copy-on-Write
+# makes these operations cheap (share memory until an actual write happens)
+# without changing any pipeline behaviour.
+pd.set_option("mode.copy_on_write", True)
+
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"   # suppress TensorFlow startup messages
 
 import tensorflow as tf
@@ -52,16 +64,32 @@ from sklearn.metrics import (
     f1_score, confusion_matrix, classification_report,
 )
 
+from forecast_config import (
+    LSTM_WINDOW_SIZE, FORECAST_HORIZON_ROWS, FORECAST_HORIZON_SECONDS,
+    SAMPLE_INTERVAL_SECONDS, CURRENT_LABEL_COL, FUTURE_LABEL_COL,
+    SESSION_ID_COL,
+)
+from forecast_utils import (
+    naive_baseline_metrics, transition_report, upsert_comparison_report,
+    session_row_ranges, downcast_numeric_dtypes,
+)
+
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
 
 LABELED_DATA_PATH      = os.path.join("data", "processed", "labeled_dataset.csv")
-LSTM_MODEL_SAVE_PATH   = os.path.join("models", "lstm_model.keras")
-SCALER_SAVE_PATH       = os.path.join("models", "lstm_scaler.pkl")
+# Renamed from lstm_model.keras / lstm_scaler.pkl — this model now targets
+# degradation_risk_future (section 28 of the correction brief).
+LSTM_MODEL_SAVE_PATH   = os.path.join("models", "lstm_forecast_5s.keras")
+SCALER_SAVE_PATH       = os.path.join("models", "lstm_scaler_forecast_5s.pkl")
 COMPARISON_REPORT_PATH = os.path.join("models", "comparison_report.json")
 
-WINDOW_SIZE  = 20     # how many past readings the LSTM looks at per prediction
+# WINDOW_SIZE (how many past rows the LSTM looks at) is intentionally kept as
+# its OWN constant, separate from FORECAST_HORIZON_ROWS (how far ahead it
+# predicts) — see forecast_config.py's comment on LSTM_WINDOW_SIZE. They both
+# happen to equal 20 today; that is a coincidence, not a dependency.
+WINDOW_SIZE  = LSTM_WINDOW_SIZE
 EPOCHS       = 30     # maximum training rounds (early stopping usually stops earlier)
 BATCH_SIZE   = 512    # sequences per gradient update — larger = faster with big datasets
 TEST_SIZE    = 0.2    # must match RF and XGBoost for fair comparison
@@ -97,6 +125,13 @@ def load_data(path):
 
     df = pd.read_csv(path, index_col="timestamp", parse_dates=True)
 
+    # Re-downcast — pandas.read_csv re-infers float64/int64 from the CSV
+    # text regardless of what dtypes were used when it was written. This
+    # matters even more here: scale_features() below builds a full float32
+    # numpy copy of the feature matrix, so starting from float32 instead of
+    # float64 halves that allocation too.
+    df = downcast_numeric_dtypes(df)
+
     # Check all expected feature columns are present
     missing_cols = [c for c in FEATURE_COLS if c not in df.columns]
     if missing_cols:
@@ -105,11 +140,19 @@ def load_data(path):
             f"  {missing_cols}\n"
             f"Re-run clean_dataset.py and label_dataset.py to regenerate."
         )
+    if FUTURE_LABEL_COL not in df.columns:
+        raise ValueError(
+            f"ERROR: '{FUTURE_LABEL_COL}' column is missing from the dataset.\n"
+            f"Re-run label_dataset.py — it must be the version that creates the "
+            f"future forecasting target (see docs/FORECASTING_METHODOLOGY_UPDATE.md)."
+        )
 
     print(f"  Rows:          {df.shape[0]:,}")
     print(f"  Features used: {len(FEATURE_COLS)}")
-    print(f"  Normal   (0):  {(df['degradation_risk']==0).sum():,}")
-    print(f"  Degraded (1):  {(df['degradation_risk']==1).sum():,}")
+    print(f"  Target column: '{FUTURE_LABEL_COL}' "
+          f"(degradation state ~{FORECAST_HORIZON_SECONDS}s ahead)")
+    print(f"  Normal   (0):  {(df[FUTURE_LABEL_COL]==0).sum():,}")
+    print(f"  Degraded (1):  {(df[FUTURE_LABEL_COL]==1).sum():,}")
     return df
 
 
@@ -136,7 +179,12 @@ def scale_features(df, split_idx):
     print_section("STEP 2 — Scaling features to [0, 1]")
 
     X_all = df[FEATURE_COLS].values.astype(np.float32)
-    y_all = df["degradation_risk"].values.astype(np.int8)
+    # y_all is the FUTURE target (degradation_risk_future) — what the LSTM
+    # must learn to predict, ~FORECAST_HORIZON_SECONDS ahead of each row.
+    y_all = df[FUTURE_LABEL_COL].values.astype(np.int8)
+    # current_all (label_now) is kept only for the naive baseline / transition
+    # analysis later — it is never used as a model input.
+    current_all = df[CURRENT_LABEL_COL].values.astype(np.int8)
 
     # Replace any infinity values before scaling (can occur with prb_grant_ratio)
     X_all = np.where(np.isinf(X_all), np.nan, X_all)
@@ -164,96 +212,155 @@ def scale_features(df, split_idx):
 class WindowGenerator(Sequence):
     """
     A Keras-compatible data generator that creates sliding-window sequences
-    on demand, one batch at a time.
+    on demand, one batch at a time, from an explicit list of valid window
+    START positions (see compute_valid_window_starts()).
 
-    WHY A GENERATOR INSTEAD OF np.array?
-    Building all windows at once requires:
-      19 million rows × 20 window × 18 features × 4 bytes = ~27 GB
+    METHODOLOGY NOTE (forecasting correction — see docs/FORECASTING_METHODOLOGY_UPDATE.md):
+    Each sequence covers rows [start : start+window) — i.e. rows
+    (t-window+1) ... t, where t = start+window-1 is the "prediction origin"
+    (the last row the model actually sees).
 
-    A generator creates only BATCH_SIZE windows at a time:
-      512 windows × 20 × 18 × 4 bytes = ~750 KB per batch
+    The target for that sequence is y[t], i.e. y[start+window-1] — NOT
+    y[start+window] as the original same-instant version used. Because `y`
+    here is already 'degradation_risk_future' (computed in label_dataset.py
+    as label_now shifted FORECAST_HORIZON_ROWS into the future, per session),
+    y[t] already means "degradation state at t + FORECAST_HORIZON_ROWS".
+    Using y[start+window-1] (this version) means:
+        window ends at t  ->  target = state at t + horizon  (correct, 5s ahead)
+    Using y[start+window] (the old version) would have meant:
+        window ends at t  ->  target = state at (t+1) + horizon (accidentally
+        one extra row — and if window_size == horizon rows, close to double
+        the intended horizon). This is exactly the mistake section 16 of the
+        correction brief warns about, so the alignment is spelled out here
+        and re-verified by print_window_alignment_example() below.
 
-    This is the standard way to train neural networks on large datasets.
-    Keras calls __getitem__(batch_index) automatically during training.
+    WHY AN EXPLICIT valid_starts LIST INSTEAD OF A SIMPLE RANGE?
+    With more than one recording session, a plain `range(len(X)-window)`
+    would happily build a window that starts in session A and ends in
+    session B. `valid_starts` is pre-computed by compute_valid_window_starts()
+    to only include windows that lie entirely inside one session's
+    contiguous row block (see forecast_utils.session_row_ranges).
 
     Args:
-        X          — scaled feature array, shape (n_rows, n_features)
-        y          — label array, shape (n_rows,)
-        window     — how many past rows form one sequence (WINDOW_SIZE)
-        batch_size — how many sequences per batch
-        n_classes  — dict with class counts for class_weight calculation
+        X            — scaled feature array, shape (n_rows, n_features)
+        y            — FUTURE-label array, shape (n_rows,)
+        window       — how many past rows form one sequence (WINDOW_SIZE)
+        batch_size   — how many sequences per batch
+        valid_starts — sorted list/array of valid window start positions
     """
 
-    def __init__(self, X, y, window, batch_size):
-        self.X          = X
-        self.y          = y
-        self.window     = window
-        self.batch_size = batch_size
-        # Number of valid sequences: each sequence ends at row i+window
-        # so the first valid end is at row 'window' (index window-1+1)
-        self.n_sequences = len(X) - window
+    def __init__(self, X, y, window, batch_size, valid_starts):
+        self.X            = X
+        self.y            = y
+        self.window       = window
+        self.batch_size   = batch_size
+        self.valid_starts = np.asarray(valid_starts, dtype=np.int64)
+        self.n_sequences  = len(self.valid_starts)
 
     def __len__(self):
         """Number of batches per epoch."""
-        return math.ceil(self.n_sequences / self.batch_size)
+        return math.ceil(self.n_sequences / self.batch_size) if self.n_sequences else 0
 
     def __getitem__(self, batch_idx):
-        """
-        Build and return one batch of (X_batch, y_batch).
+        """Build and return one batch of (X_batch, y_batch)."""
+        batch_starts = self.valid_starts[
+            batch_idx * self.batch_size: (batch_idx + 1) * self.batch_size
+        ]
 
-        batch_idx is the batch number (0, 1, 2, ...).
-        We figure out which rows it corresponds to and slice them.
-        """
-        start = batch_idx * self.batch_size
-        end   = min(start + self.batch_size, self.n_sequences)
-
-        # Build the batch sequences
-        # Each sequence: rows [i : i+window], label: y[i+window]
-        X_batch = np.stack(
-            [self.X[i : i + self.window] for i in range(start, end)]
-        )
-        y_batch = self.y[start + self.window : end + self.window]
+        X_batch = np.stack([self.X[s: s + self.window] for s in batch_starts])
+        # Target = y at the LAST row of the window (the prediction origin t),
+        # which already holds the future-shifted label. See class docstring.
+        y_batch = self.y[batch_starts + self.window - 1]
 
         return X_batch, y_batch
 
 
-def prepare_generators(X_scaled, y_all, split_idx, window_size):
+def compute_valid_window_starts(session_ranges, window_size, target_lo, target_hi):
     """
-    Create train and validation generators.
+    Return every window start position `s` such that:
+      1. the window [s, s+window_size) lies entirely inside ONE session's
+         contiguous row block (never straddles two sessions), AND
+      2. the prediction origin t = s+window_size-1 falls inside
+         [target_lo, target_hi) — i.e. the row being predicted FOR belongs
+         to this split (train or test), even if a little context immediately
+         before the split boundary is borrowed from the previous rows for
+         the window itself.
 
-    The split point in sequence space: the last training sequence ends at
-    row split_idx-1, so the training generator covers rows 0 to split_idx.
-    The test generator covers rows split_idx to the end.
+    session_ranges: list of (start, end) row-POSITION tuples, e.g. from
+                    forecast_utils.session_row_ranges().
+
+    IMPLEMENTATION NOTE (scale fix): builds each session's valid-start range
+    as a numpy array (np.arange) rather than a Python list built from
+    range()/list.extend(). For a small dataset this makes no visible
+    difference; for tens of millions of rows a Python list of that many
+    individual int objects is meaningfully heavier (CPython list-of-ints
+    overhead, ~28 bytes/element) than one contiguous numpy int64 array
+    (8 bytes/element) — a >3x reduction for this specific structure.
+    """
+    chunks = []
+    for s_block, e_block in session_ranges:
+        s_min = max(s_block, target_lo - window_size + 1, 0)
+        s_max = min(e_block - window_size, target_hi - window_size)
+        if s_max >= s_min:
+            chunks.append(np.arange(s_min, s_max + 1, dtype=np.int64))
+    if not chunks:
+        return np.array([], dtype=np.int64)
+    return np.concatenate(chunks)
+
+
+def print_window_alignment_example(window_size, horizon_rows, sample_interval_s):
+    """
+    Print a concrete worked example of the window/target alignment, as
+    requested by section 16 of the correction brief ("add a small sanity
+    check example in comments/tests").
+    """
+    origin = 100 + window_size - 1  # arbitrary example start=100
+    print(f"\n  Window/target alignment example:")
+    print(f"    row interval     = {sample_interval_s*1000:.0f} ms")
+    print(f"    window size      = {window_size} rows")
+    print(f"    forecast horizon = {horizon_rows} rows ({horizon_rows*sample_interval_s:.1f}s)")
+    print(f"    input rows       = {origin - window_size + 1}-{origin}")
+    print(f"    prediction origin (t) = row {origin}")
+    print(f"    target = degradation_risk_future[t] "
+          f"= degradation_risk[t + {horizon_rows}] = state at row {origin + horizon_rows}")
+    print(f"    time ahead from row {origin} = {horizon_rows} x {sample_interval_s*1000:.0f}ms "
+          f"= {horizon_rows*sample_interval_s:.1f}s")
+
+
+def prepare_generators(X_scaled, y_all, df, split_idx, window_size):
+    """
+    Create train and validation generators using session-boundary-aware
+    window starts (see compute_valid_window_starts / WindowGenerator above).
     """
     print_section(f"STEP 3 — Setting up sliding window generators (size={window_size})")
 
-    # Training generator
-    X_train = X_scaled[:split_idx]
-    y_train = y_all[:split_idx]
-    train_gen = WindowGenerator(X_train, y_train, window_size, BATCH_SIZE)
+    print_window_alignment_example(window_size, FORECAST_HORIZON_ROWS, SAMPLE_INTERVAL_SECONDS)
 
-    # Test generator (used for validation during training and final evaluation)
-    X_test = X_scaled[split_idx - window_size:]   # include overlap for first window
-    y_test = y_all[split_idx - window_size:]
-    test_gen = WindowGenerator(X_test, y_test, window_size, BATCH_SIZE)
+    session_ranges = session_row_ranges(df, SESSION_ID_COL)
+    n_rows = len(X_scaled)
 
-    # Compute class distribution for class_weight
-    n_normal   = int((y_train == 0).sum())
-    n_degraded = int((y_train == 1).sum())
+    train_starts = compute_valid_window_starts(session_ranges, window_size, 0, split_idx)
+    test_starts  = compute_valid_window_starts(session_ranges, window_size, split_idx, n_rows)
 
-    n_train_seqs = len(X_train) - window_size
-    n_test_seqs  = len(X_test)  - window_size
+    train_gen = WindowGenerator(X_scaled, y_all, window_size, BATCH_SIZE, train_starts)
+    test_gen  = WindowGenerator(X_scaled, y_all, window_size, BATCH_SIZE, test_starts)
 
-    print(f"  Training sequences:   {n_train_seqs:,}")
-    print(f"  Test sequences:       {n_test_seqs:,}")
-    print(f"  Batches per epoch:    {len(train_gen):,} (batch size = {BATCH_SIZE})")
-    print(f"  Memory per batch:     {BATCH_SIZE * window_size * len(FEATURE_COLS) * 4 / 1024:.0f} KB")
-    print(f"  Train Normal:         {n_normal:,}   Degraded: {n_degraded:,}")
+    # Compute class distribution for class_weight (over TRAIN targets only)
+    train_targets = y_all[np.asarray(train_starts, dtype=np.int64) + window_size - 1] if len(train_starts) > 0 else np.array([])
+    n_normal   = int((train_targets == 0).sum())
+    n_degraded = int((train_targets == 1).sum())
 
-    class_weight = {0: 1.0, 1: n_normal / max(n_degraded, 1)}
-    print(f"  Class weights:        Normal=1.0  Degraded={class_weight[1]:.2f}")
+    print(f"\n  Sessions found:        {len(session_ranges)}")
+    print(f"  Training sequences:    {len(train_starts):,}")
+    print(f"  Test sequences:        {len(test_starts):,}")
+    print(f"  Batches per epoch:     {len(train_gen):,} (batch size = {BATCH_SIZE})")
+    print(f"  Memory per batch:      {BATCH_SIZE * window_size * len(FEATURE_COLS) * 4 / 1024:.0f} KB")
+    print(f"  Train Normal:          {n_normal:,}   Degraded: {n_degraded:,}")
 
-    return train_gen, test_gen, class_weight, n_test_seqs
+    class_weight = {0: 1.0, 1: (n_normal / max(n_degraded, 1))}
+    print(f"  Class weights:         Normal=1.0  Degraded={class_weight[1]:.2f}")
+
+    return train_gen, test_gen, class_weight, len(test_starts)
 
 
 # =============================================================================
@@ -355,16 +462,14 @@ def evaluate_model(model, test_gen, n_test_seqs):
 
     print(f"  Running predictions on {n_test_seqs:,} test sequences...")
     y_prob = model.predict(test_gen, verbose=0).flatten()
-
-    # Trim to the exact number of test sequences
-    # (the last batch may be padded slightly by the generator)
     y_prob = y_prob[:n_test_seqs]
 
-    # Reconstruct the true labels for the test sequences
-    # Test sequences start from index WINDOW_SIZE in the test slice
-    X_test_arr = test_gen.X
-    y_test_arr = test_gen.y
-    y_test = y_test_arr[WINDOW_SIZE : WINDOW_SIZE + n_test_seqs]
+    # Reconstruct the true (future) labels for the test sequences directly
+    # from the generator's own valid_starts + window alignment — this stays
+    # correct regardless of session boundaries or dataset size, unlike
+    # slicing the array by a fixed offset.
+    target_idx = test_gen.valid_starts[:n_test_seqs] + test_gen.window - 1
+    y_test     = test_gen.y[target_idx]
 
     # Apply 0.5 threshold: probability >= 0.5 → Degraded (1)
     y_pred = (y_prob >= 0.5).astype(int)
@@ -373,10 +478,10 @@ def evaluate_model(model, test_gen, n_test_seqs):
     precision = precision_score(y_test, y_pred, zero_division=0)
     recall    = recall_score(y_test, y_pred, zero_division=0)
     f1        = f1_score(y_test, y_pred, zero_division=0)
-    tn, fp, fn, tp = confusion_matrix(y_test, y_pred).ravel()
+    tn, fp, fn, tp = confusion_matrix(y_test, y_pred, labels=[0, 1]).ravel()
 
     print(f"\n  +-------------------------------------+")
-    print(f"  |  LSTM (window = {WINDOW_SIZE})               |")
+    print(f"  |  LSTM (window={WINDOW_SIZE}, forecast={FORECAST_HORIZON_SECONDS}s) |")
     print(f"  +-------------------------------------+")
     print(f"  |  Accuracy   : {accuracy:>8.4f}  ({accuracy*100:.2f}%)  |")
     print(f"  |  Precision  : {precision:>8.4f}  ({precision*100:.2f}%)  |")
@@ -388,17 +493,17 @@ def evaluate_model(model, test_gen, n_test_seqs):
     print(f"  Actual Normal  (0)    {tn:>9,}      {fp:>9,}")
     print(f"  Actual Degraded(1)    {fn:>9,}      {tp:>9,}")
     print(f"\n  Full classification report:")
-    print(classification_report(y_test, y_pred, target_names=["Normal", "Degraded"]))
+    print(classification_report(y_test, y_pred, target_names=["Normal", "Degraded"], zero_division=0))
 
     return {
-        "model":       "LSTM",
+        "model":       "LSTM (5s forecast)",
         "accuracy":    round(float(accuracy),  4),
         "precision":   round(float(precision), 4),
         "recall":      round(float(recall),    4),
         "f1_score":    round(float(f1),        4),
         "tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp),
         "window_size": WINDOW_SIZE,
-    }
+    }, y_test, y_pred
 
 
 # =============================================================================
@@ -406,7 +511,7 @@ def evaluate_model(model, test_gen, n_test_seqs):
 # =============================================================================
 
 def three_way_comparison(lstm_metrics):
-    print_section("STEP 7 — Three-way comparison: RF vs XGBoost vs LSTM")
+    print_section("STEP 7 — Comparison: Naive Baseline vs RF vs XGBoost vs LSTM")
 
     if not os.path.exists(COMPARISON_REPORT_PATH):
         print("  Warning: comparison_report.json not found.")
@@ -416,7 +521,7 @@ def three_way_comparison(lstm_metrics):
     with open(COMPARISON_REPORT_PATH) as f:
         existing = json.load(f)["models"]
 
-    # Only keep RF and XGBoost entries — remove any old LSTM entry
+    # Only keep non-LSTM entries — remove any old LSTM entry before adding ours
     existing = [m for m in existing if "LSTM" not in m.get("model", "")]
     all_m    = existing + [lstm_metrics]
 
@@ -425,9 +530,9 @@ def three_way_comparison(lstm_metrics):
 
     print(f"\n  {'Metric':<12}", end="")
     for m in all_m:
-        print(f"  {m['model'][:18]:>18}", end="")
+        print(f"  {m['model'][:24]:>24}", end="")
     print("  Winner")
-    print("  " + "-" * 70)
+    print("  " + "-" * 90)
 
     for key, label in zip(metric_keys, metric_labels):
         vals = [m[key] for m in all_m]
@@ -435,13 +540,13 @@ def three_way_comparison(lstm_metrics):
         print(f"  {label:<12}", end="")
         for m in all_m:
             marker = "*" if m[key] == best else " "
-            print(f"  {m[key]*100:>16.2f}%{marker}", end="")
+            print(f"  {m[key]*100:>22.2f}%{marker}", end="")
         winner = all_m[vals.index(best)]["model"]
         print(f"  {winner}")
 
     print(f"\n  Missed degradation events (False Negatives — lower is better):")
     for m in all_m:
-        print(f"    {m['model']:<22}  FN = {m['fn']:,}  TP = {m['tp']:,}")
+        print(f"    {m['model']:<28}  FN = {m['fn']:,}  TP = {m['tp']:,}")
 
     return all_m
 
@@ -473,10 +578,10 @@ def save_outputs(model, scaler, all_metrics):
 def main():
     print("\n" + "=" * 65)
     print("  LSTM Training — O-RAN KPI Prediction xApp")
-    print("  Memory-efficient generator-based training")
+    print(f"  Forecasting {FORECAST_HORIZON_SECONDS}s ahead — memory-efficient generator-based training")
     print("=" * 65)
 
-    # Step 1 — Load the labeled dataset
+    # Step 1 — Load the labeled dataset (must contain degradation_risk_future)
     df = load_data(LABELED_DATA_PATH)
 
     # Split index for 80/20 — must match RF and XGBoost
@@ -485,9 +590,9 @@ def main():
     # Step 2 — Scale all features to [0, 1]
     X_scaled, y_all, scaler = scale_features(df, split_idx)
 
-    # Step 3 — Create memory-efficient generators (no giant array in RAM)
+    # Step 3 — Create session-boundary-aware, memory-efficient generators
     train_gen, test_gen, class_weight, n_test_seqs = prepare_generators(
-        X_scaled, y_all, split_idx, WINDOW_SIZE
+        X_scaled, y_all, df, split_idx, WINDOW_SIZE
     )
 
     # Step 4 — Build the LSTM network
@@ -497,17 +602,28 @@ def main():
     model = train_model(model, train_gen, test_gen, class_weight)
 
     # Step 6 — Evaluate on the test set
-    lstm_metrics = evaluate_model(model, test_gen, n_test_seqs)
+    lstm_metrics, y_test, y_pred = evaluate_model(model, test_gen, n_test_seqs)
 
-    # Step 7 — Print three-way comparison with RF and XGBoost
+    # Step 6b — Naive baseline + transition analysis on the SAME test sequences
+    # (aligned to the same prediction-origin rows the LSTM was evaluated on)
+    print_section("STEP 6b — Naive baseline on the LSTM's test sequences")
+    target_idx  = test_gen.valid_starts[:n_test_seqs] + test_gen.window - 1
+    current_test = pd.Series(df[CURRENT_LABEL_COL].to_numpy()[target_idx])
+    future_test  = pd.Series(y_test)
+    baseline_metrics = naive_baseline_metrics(current_test, future_test)
+    transition_report(current_test, future_test, predicted_future=y_pred)
+
+    # Step 7 — Print comparison with Naive Baseline, RF and XGBoost
     all_metrics = three_way_comparison(lstm_metrics)
 
-    # Step 8 — Save everything
+    # Step 8 — Save everything (also (re-)upserts the baseline entry so this
+    # script is runnable standalone without erasing RF/XGB's copy of it)
+    upsert_comparison_report(COMPARISON_REPORT_PATH, baseline_metrics)
     save_outputs(model, scaler, all_metrics)
 
     print("\n" + "=" * 65)
     print("  LSTM training complete!")
-    print(f"  F1 Score : {lstm_metrics['f1_score']}")
+    print(f"  F1 Score : {lstm_metrics['f1_score']}  (baseline: {baseline_metrics['f1_score']})")
     print(f"  Model    : {LSTM_MODEL_SAVE_PATH}")
     print("=" * 65 + "\n")
 

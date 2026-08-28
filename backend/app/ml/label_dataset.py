@@ -23,9 +23,38 @@
 #   This makes the labelling logic self-adapting and data-driven.
 # =============================================================================
 
+import json
 from pathlib import Path
 import pandas as pd
+
+# Enable pandas Copy-on-Write mode. Without this, pandas <3.0 defaults to
+# eagerly DEEP-COPYING the entire DataFrame inside routine calls like
+# rename()/drop()/set_index() (see pandas.core.generic._rename's internal
+# `self.copy(deep=copy and not using_copy_on_write())`). On a small sample
+# dataset that's invisible; on a real O-RAN recording with tens of millions
+# of rows, EVERY such call briefly allocates a full extra multi-GB copy and
+# can crash with numpy.core._exceptions._ArrayMemoryError. Copy-on-Write
+# makes these operations cheap (share memory until an actual write happens)
+# without changing any pipeline behaviour.
+pd.set_option("mode.copy_on_write", True)
 import numpy as np
+
+from forecast_config import (
+    FORECAST_HORIZON_ROWS,
+    FORECAST_HORIZON_SECONDS,
+    SAMPLE_INTERVAL_SECONDS,
+    SESSION_ID_COL,
+    CURRENT_LABEL_COL,
+    FUTURE_LABEL_COL,
+    verify_sampling_interval,
+)
+from forecast_utils import (
+    add_future_label,
+    check_label_shift,
+    check_session_boundaries,
+    transition_report,
+    downcast_numeric_dtypes,
+)
 
 # =============================================================================
 # CONFIGURATION
@@ -39,6 +68,12 @@ CLEAN_DATA_PATH   = Path("data") / "processed" / "cleaned_dataset.csv"
 
 # Output: labeled dataset used by all three training scripts
 LABELED_DATA_PATH = Path("data") / "processed" / "labeled_dataset.csv"
+
+# Output: the quantile thresholds computed below, persisted so the backend
+# API can compute a RULE-BASED "current status" for a single incoming row
+# without needing the full training dataset at request time (see
+# app/utils/degradation_rule.py).
+THRESHOLDS_PATH = Path("models") / "degradation_thresholds.json"
 
 # A row is labelled as DEGRADED (1) if it scores badly on >= this many indicators.
 # Set to 2 so that a single bad reading does not trigger a false alarm.
@@ -75,6 +110,12 @@ def load_clean_data(path):
 
     # parse_dates=True converts the index back into datetime objects
     df = pd.read_csv(path, index_col="timestamp", parse_dates=True)
+
+    # pandas.read_csv re-infers float64/int64 from the text regardless of
+    # what dtypes clean_dataset.py wrote — re-downcast here so the rest of
+    # this script (scoring, future-label shift, saving) stays memory-light
+    # on a large real recording. See forecast_utils.downcast_numeric_dtypes().
+    df = downcast_numeric_dtypes(df)
 
     print(f"  Loaded: {path}")
     print(f"  Rows:   {df.shape[0]}")
@@ -335,26 +376,98 @@ def score_row(row, thresholds):
 
 def create_labels(df, thresholds):
     """
-    Apply score_row() to every row in the DataFrame to create:
+    Score every row against the 7 KPI conditions to create:
       - 'degradation_score': how many bad conditions fired (0–7)
       - 'degradation_risk':  final binary label (0 = Normal, 1 = Degraded)
+
+    IMPLEMENTATION NOTE (scale fix):
+    This used to call df.apply(score_row, axis=1) — evaluating score_row()
+    as a Python function once per row. That's fine for a few thousand rows,
+    but for a real O-RAN recording of tens of millions of rows it is
+    catastrophically slow (df.apply(axis=1) does not vectorize; it's a
+    Python-level loop with per-row function-call overhead, easily taking
+    hours on a dataset this size).
+
+    This computes the EXACT SAME 7 conditions as score_row() — see that
+    function's docstring for the reasoning behind each one — but as
+    vectorized boolean comparisons summed across the whole column at once
+    (milliseconds instead of hours for tens of millions of rows). A
+    self-check against score_row() on a small sample runs automatically
+    below to guard against the two implementations drifting apart.
+
+    score_row() itself is kept and still used as-is by
+    app/utils/degradation_rule.py, where the input truly is a single row
+    (one incoming API request) and the per-row-function-call style is
+    appropriate there.
+
+    METHODOLOGY NOTE (forecasting correction):
+    This label describes the network's condition AT THE SAME ROW/TIMESTAMP
+    the KPIs were measured — internally we refer to this as "label_now" or
+    the "current degradation assessment". This deterministic, rule-based
+    definition is NOT being changed by the forecasting correction and
+    remains the ground-truth generator.
+
+    What changes is which timestamp's value of this label is used as the
+    ML *target*: see add_future_label() / 'degradation_risk_future' below,
+    which shifts this same rule-based assessment FORECAST_HORIZON_ROWS into
+    the future, independently within each recording session. The model is
+    trained to predict that future value, not this current one.
     """
     print_section("STEP 4 — Scoring rows and creating degradation_risk label")
 
-    print(f"\n  Scoring each of {len(df)} rows against 7 KPI conditions...")
+    print(f"\n  Scoring each of {len(df)} rows against 7 KPI conditions "
+          f"(vectorized — fast even for millions of rows)...")
     print(f"  A row is labelled DEGRADED if score >= {DEGRADATION_SCORE_THRESHOLD}\n")
 
-    # Apply score_row to every row — this is the core labelling step
-    df["degradation_score"] = df.apply(
-        lambda row: score_row(row, thresholds), axis=1
-    )
+    score = pd.Series(0, index=df.index, dtype=np.int8)
+
+    score += (df["rx_errors_uplink_pct"] > thresholds["rx_errors_uplink_pct_high"]).to_numpy(dtype=np.int8)
+    score += (df["dl_cqi"] < thresholds["dl_cqi_low"]).to_numpy(dtype=np.int8)
+    score += (df["tx_brate_downlink_mbps"] < thresholds["tx_brate_downlink_mbps_low"]).to_numpy(dtype=np.int8)
+    score += (df["prb_grant_ratio"] < thresholds["prb_grant_ratio_low"]).to_numpy(dtype=np.int8)
+    score += (df["dl_mcs"] < thresholds["dl_mcs_low"]).to_numpy(dtype=np.int8)
+    score += ((df["ul_sinr"] > 0) & (df["ul_sinr"] < thresholds["ul_sinr_low"])).to_numpy(dtype=np.int8)
+    score += ((df["ul_turbo_iters"] > 0) & (df["ul_turbo_iters"] > thresholds["ul_turbo_iters_high"])).to_numpy(dtype=np.int8)
+
+    df["degradation_score"] = score
 
     # Binary label: 1 if score meets threshold, 0 otherwise
     df["degradation_risk"] = (
         df["degradation_score"] >= DEGRADATION_SCORE_THRESHOLD
-    ).astype(int)
+    ).astype(np.int8)
+
+    _verify_vectorized_scoring_matches_score_row(df, thresholds)
 
     return df
+
+
+def _verify_vectorized_scoring_matches_score_row(df, thresholds, sample_size=200):
+    """
+    Self-check: re-run the original row-by-row score_row() on a small random
+    sample and confirm it agrees with the vectorized 'degradation_score'
+    computed above. Catches the vectorized version drifting out of sync with
+    score_row() (e.g. after a future edit to one but not the other) without
+    paying the cost of running score_row() on the full dataset.
+    """
+    n = min(sample_size, len(df))
+    if n == 0:
+        return
+    sample = df.sample(n=n, random_state=0)
+
+    mismatches = 0
+    for _, row in sample.iterrows():
+        expected = score_row(row, thresholds)
+        actual = int(row["degradation_score"])
+        if expected != actual:
+            mismatches += 1
+
+    if mismatches:
+        print(f"  ⚠ WARNING: vectorized scoring disagreed with score_row() on "
+              f"{mismatches}/{n} sampled rows — vectorized create_labels() may "
+              f"have drifted out of sync with score_row(). Investigate before "
+              f"trusting the labels.")
+    else:
+        print(f"  ✓ Vectorized scoring verified against score_row() on {n} sampled rows.")
 
 
 # =============================================================================
@@ -421,6 +534,85 @@ def print_risk_distribution(df):
 
 
 # =============================================================================
+# STEP — Save the quantile thresholds for the backend rule-based endpoint
+# =============================================================================
+
+def save_thresholds(thresholds, path):
+    """
+    Persist the data-driven quantile thresholds computed in compute_thresholds()
+    so the backend API can compute a rule-based "current status" for a single
+    incoming KPI row (see app/utils/degradation_rule.py) without re-deriving
+    quantiles from a live request of one row.
+    """
+    print_section("Saving degradation-rule thresholds for the API")
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    payload = {
+        "thresholds": {k: float(v) for k, v in thresholds.items()},
+        "degradation_score_threshold": DEGRADATION_SCORE_THRESHOLD,
+    }
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2)
+
+    print(f"  ✓ Saved: {path}")
+
+
+# =============================================================================
+# STEP — Create the future forecasting target (the core of the correction)
+# =============================================================================
+
+def create_future_label(df):
+    """
+    Shift 'degradation_risk' (label_now) FORECAST_HORIZON_ROWS rows into the
+    future, independently within each 'session_id' group, to produce
+    'degradation_risk_future' — the actual ML target for a genuine
+    forecasting model.
+
+    See forecast_utils.add_future_label() for the implementation and
+    docs/FORECASTING_METHODOLOGY_UPDATE.md for the full rationale.
+    """
+    print_section(
+        f"STEP 4b — Creating future forecasting target "
+        f"({FORECAST_HORIZON_SECONDS}s / {FORECAST_HORIZON_ROWS} rows ahead)"
+    )
+
+    print(f"\n  Forecast horizon   : {FORECAST_HORIZON_SECONDS}s "
+          f"({FORECAST_HORIZON_ROWS} rows @ ~{SAMPLE_INTERVAL_SECONDS*1000:.0f}ms/row)")
+
+    # Sanity-check the sampling-interval assumption against the real data
+    # before trusting a row-count shift to mean "5 seconds" (section 18).
+    verify_sampling_interval(df)
+
+    df = add_future_label(df)
+
+    # Regression-guard sanity checks (section 32) — cheap to run every time.
+    check_label_shift(df)
+    check_session_boundaries(df)
+
+    return df
+
+
+def print_future_label_distribution(df):
+    """Print the class distribution of the NEW forecasting target, plus the
+    Normal->Degraded / Degraded->Normal transition breakdown."""
+    print_section("Future-target ('degradation_risk_future') distribution")
+
+    total = len(df)
+    n_degraded = int(df[FUTURE_LABEL_COL].sum())
+    n_normal = total - n_degraded
+    print(f"\n  Normal   (0): {n_normal:>6}  ({n_normal/total*100:.1f}%)")
+    print(f"  Degraded (1): {n_degraded:>6}  ({n_degraded/total*100:.1f}%)")
+
+    transition_report(
+        current=df[CURRENT_LABEL_COL],
+        future=df[FUTURE_LABEL_COL],
+        predicted_future=df[CURRENT_LABEL_COL],  # naive baseline, for context only
+    )
+
+
+# =============================================================================
 # STEP 6 — Print the final feature list
 # =============================================================================
 
@@ -431,10 +623,16 @@ def print_feature_list(df):
     """
     print_section("STEP 6 — Final feature list for ML training")
 
-    # Feature columns = everything except the two new label columns
+    # Feature columns = everything except label/session metadata columns.
+    # 'session_id' and 'degradation_risk_future' are excluded here for the
+    # same reason 'degradation_risk'/'degradation_score' always were: they
+    # must never be fed to the model as an input.
     feature_cols = [
         col for col in df.columns
-        if col not in ("degradation_risk", "degradation_score")
+        if col not in (
+            "degradation_risk", "degradation_score",
+            FUTURE_LABEL_COL, SESSION_ID_COL,
+        )
     ]
 
     print(f"\n  Feature columns ({len(feature_cols)} total):")
@@ -469,7 +667,9 @@ def save_labeled_data(df, path):
 
     print(f"  ✓ Saved to: {path}")
     print(f"  Rows:    {df.shape[0]}")
-    print(f"  Columns: {df.shape[1]}  (18 features + degradation_score + degradation_risk)")
+    print(f"  Columns: {df.shape[1]}  "
+          f"(18 features + session_id + degradation_score + degradation_risk [label_now] "
+          f"+ degradation_risk_future [label_future, the ML target])")
     print(f"  Size:    {Path(path).stat().st_size / 1024:.1f} KB")
 
 
@@ -492,11 +692,18 @@ def main():
     # Step 3 — Compute data-driven quantile thresholds
     thresholds = compute_thresholds(df)
 
-    # Step 4 — Score every row and create the label
+    # Step 4 — Score every row and create the CURRENT-STATE label (label_now)
     df = create_labels(df, thresholds)
 
-    # Step 5 — Print risk distribution
+    # Step 4a — Persist thresholds for the backend's rule-based current-status check
+    save_thresholds(thresholds, THRESHOLDS_PATH)
+
+    # Step 4b — Create the FUTURE forecasting target (the actual ML target)
+    df = create_future_label(df)
+
+    # Step 5 — Print risk distribution (both current-state and future target)
     print_risk_distribution(df)
+    print_future_label_distribution(df)
 
     # Step 6 — Print the final feature list
     print_feature_list(df)
@@ -506,6 +713,8 @@ def main():
 
     print("\n" + "=" * 65)
     print("  ✓ Feature engineering complete!")
+    print(f"  ML target is now 'degradation_risk_future' "
+          f"({FORECAST_HORIZON_SECONDS}s ahead) — NOT 'degradation_risk'.")
     print("  Next step: Phase 2 — Train Random Forest and XGBoost classifiers.")
     print("=" * 65 + "\n")
 

@@ -83,10 +83,15 @@ export interface StreamRow {
   ul_turbo_iters: number;
   prb_grant_ratio: number;
   actual_risk: number;
+  actual_future_risk?: number | null;
   predicted_risk: number;
   risk_label: "Normal" | "Degraded";
   probability: number;
   recommendation: string;
+  forecast_horizon_seconds?: number;
+  current_status?: "Normal" | "Degraded" | null;
+  current_score?: number | null;
+  early_warning?: boolean;
 }
 
 // --- Model comparison ---

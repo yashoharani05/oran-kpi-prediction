@@ -5,6 +5,15 @@
 #   Simulate live O-RAN monitoring by streaming rows from the labeled CSV
 #   one at a time, on demand. The frontend polls every 2 seconds.
 #
+# METHODOLOGY NOTE (forecasting correction):
+#   'predicted_risk'/'risk_label'/'probability' below are now the model's
+#   FORECAST for ~forecast_horizon_seconds ahead of the streamed row, not the
+#   same-instant state. 'current_status' is the deterministic rule-based
+#   assessment for the row as-is (section 23) — always computed separately
+#   from the ML forecast. 'actual_future_risk' is the ground-truth future
+#   label from the dataset, for measuring forecast accuracy in this demo.
+#   See docs/FORECASTING_METHODOLOGY_UPDATE.md.
+#
 # WHY "SIMULATE"?
 #   We don't have a live O-RAN testbed running, so we replay the real
 #   testbed CSV row by row. Each call to GET /api/stream/next returns
@@ -32,6 +41,10 @@ from pydantic import BaseModel
 from typing import Optional
 
 from app.utils.recommender import get_recommendation
+from app.utils.degradation_rule import current_status as compute_current_status
+from app.ml.forecast_config import (
+    FORECAST_HORIZON_SECONDS, FORECAST_ALERT_THRESHOLD, FUTURE_LABEL_COL,
+)
 
 router = APIRouter()
 
@@ -59,16 +72,22 @@ class StreamState:
     Holds the dataset and tracks which row is next to be served.
 
     Attributes:
-        df      — the full labeled DataFrame (2090 rows)
+        df      — the full labeled DataFrame (post future-label trimming)
         cursor  — index of the next row to return (0-based)
         total   — total number of rows in the dataset
         loaded  — True if the CSV was loaded successfully
+        last_early_warning — tracks whether an early-warning alert is
+                              CURRENTLY active, so we only report a NEW
+                              alert once per Normal->Degraded transition
+                              instead of every 2-second poll (correction
+                              brief section 26 — avoid notification spam).
     """
     def __init__(self):
         self.df:     Optional[pd.DataFrame] = None
         self.cursor: int = 0
         self.total:  int = 0
         self.loaded: bool = False
+        self.last_early_warning: bool = False
 
     def load(self, path: str):
         """Load the labeled CSV from disk. Called once at startup."""
@@ -89,6 +108,7 @@ class StreamState:
     def reset(self):
         """Rewind the cursor to the beginning."""
         self.cursor = 0
+        self.last_early_warning = False
 
 
 # Global instance — created here, populated in main.py lifespan
@@ -127,14 +147,30 @@ class StreamRow(BaseModel):
     ul_turbo_iters:          float
     prb_grant_ratio:         float
 
-    # The actual label from the dataset (ground truth)
-    actual_risk:   int    # 0 or 1 — what the label_dataset.py script assigned
+    # The actual label from the dataset (ground truth, CURRENT instant)
+    actual_risk:   int    # 0 or 1 — what the label_dataset.py rule assigns to THIS row right now
 
-    # ML model prediction
-    predicted_risk:   int    # 0 or 1 — what the Random Forest predicts
-    risk_label:       str    # "Normal" or "Degraded"
-    probability:      float  # 0.0 – 1.0
+    # Ground truth for the FUTURE forecasting target, when available in the
+    # dataset (it always is, post-correction — rows without a valid future
+    # value are dropped by label_dataset.py). Optional purely for backward
+    # compatibility with an old labeled_dataset.csv that predates the
+    # forecasting correction.
+    actual_future_risk: Optional[int] = None
+
+    # ML model prediction — this is now the FORECAST (~forecast_horizon_seconds ahead)
+    predicted_risk:   int    # 0 or 1 — the model's forecast for t + horizon
+    risk_label:       str    # "Normal" or "Degraded" (forecast)
+    probability:      float  # 0.0 – 1.0 (forecast confidence)
     recommendation:   str
+    forecast_horizon_seconds: int = 5
+
+    # Rule-based CURRENT status — independent of the ML model (section 23)
+    current_status: Optional[str] = None
+    current_score:  Optional[int] = None
+
+    # True only on the Normal->Degraded transition edge (deduped — see
+    # StreamState.last_early_warning / correction brief section 26)
+    early_warning: bool = False
 
 
 class StreamStatus(BaseModel):
@@ -194,13 +230,31 @@ def stream_next(request: Request):
     # --- Build feature DataFrame (named columns avoid sklearn warning) ---
     X = pd.DataFrame([{col: row[col] for col in FEATURE_COLS}])
 
-    # --- Run the ML model ---
+    # --- Run the ML model (forecast ~forecast_horizon_seconds ahead) ---
     predicted_risk = int(model.predict(X)[0])
     probability    = float(model.predict_proba(X)[0][1])
 
     # --- Build recommendation ---
     recommendation = get_recommendation(predicted_risk, probability)
     risk_label     = "Degraded" if predicted_risk == 1 else "Normal"
+
+    # --- Rule-based CURRENT status, independent of the forecast model ---
+    kpi_dict = {col: row[col] for col in FEATURE_COLS}
+    status_label, status_score = compute_current_status(kpi_dict)
+
+    # --- Early warning, de-duplicated so it only fires ONCE per
+    #     Normal->Degraded transition rather than on every 2-second poll
+    #     (correction brief section 26) ---
+    is_early_warning_now = (
+        status_label == "Normal"
+        and predicted_risk == 1
+        and probability >= FORECAST_ALERT_THRESHOLD
+    )
+    fire_alert = is_early_warning_now and not stream_state.last_early_warning
+    stream_state.last_early_warning = is_early_warning_now
+
+    # --- Ground truth for the future target, if present in this dataset ---
+    actual_future_risk = int(row[FUTURE_LABEL_COL]) if FUTURE_LABEL_COL in row.index else None
 
     # --- Return the streamed row ---
     return StreamRow(
@@ -228,14 +282,21 @@ def stream_next(request: Request):
         ul_turbo_iters         = float(row["ul_turbo_iters"]),
         prb_grant_ratio        = float(row["prb_grant_ratio"]),
 
-        # Ground truth label (from label_dataset.py)
-        actual_risk    = int(row["degradation_risk"]),
+        # Ground truth labels
+        actual_risk         = int(row["degradation_risk"]),
+        actual_future_risk  = actual_future_risk,
 
-        # Model prediction
+        # Model forecast
         predicted_risk = predicted_risk,
         risk_label     = risk_label,
         probability    = round(probability, 4),
         recommendation = recommendation,
+        forecast_horizon_seconds = FORECAST_HORIZON_SECONDS,
+
+        # Rule-based current status + deduped early warning
+        current_status = status_label,
+        current_score  = status_score,
+        early_warning  = fire_alert,
     )
 
 

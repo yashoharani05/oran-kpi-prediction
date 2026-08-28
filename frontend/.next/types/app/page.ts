@@ -1,4 +1,4 @@
-// File: E:\FYP\fyp-oran-kpi-prediction\frontend\src\app\page.tsx
+// File: D:\Projects\Python\KPI prediction for O-RAN networks\fyp-oran-kpi-prediction\frontend\src\app\page.tsx
 import * as entry from '../../../src/app/page.js'
 import type { ResolvingMetadata, ResolvingViewport } from 'next/dist/lib/metadata/types/metadata-interface.js'
 

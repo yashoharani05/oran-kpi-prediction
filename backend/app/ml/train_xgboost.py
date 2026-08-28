@@ -12,8 +12,8 @@
 #   backend/data/processed/labeled_dataset.csv
 #
 # OUTPUT:
-#   backend/models/xgboost_model.pkl      ← saved trained model
-#   backend/models/comparison_report.txt  ← side-by-side metrics file
+#   backend/models/xgboost_forecast_5s.pkl ← saved trained model (predicts 5s-ahead state)
+#   backend/models/comparison_report.json  ← side-by-side metrics file (baseline + RF + XGB)
 #
 # WHAT IS XGBOOST?
 #   XGBoost (Extreme Gradient Boosting) builds trees SEQUENTIALLY.
@@ -34,6 +34,17 @@ import joblib
 import numpy as np
 import pandas as pd
 
+# Enable pandas Copy-on-Write mode. Without this, pandas <3.0 defaults to
+# eagerly DEEP-COPYING the entire DataFrame inside routine calls like
+# rename()/drop()/set_index() (see pandas.core.generic._rename's internal
+# `self.copy(deep=copy and not using_copy_on_write())`). On a small sample
+# dataset that's invisible; on a real O-RAN recording with tens of millions
+# of rows, EVERY such call briefly allocates a full extra multi-GB copy and
+# can crash with numpy.core._exceptions._ArrayMemoryError. Copy-on-Write
+# makes these operations cheap (share memory until an actual write happens)
+# without changing any pipeline behaviour.
+pd.set_option("mode.copy_on_write", True)
+
 from xgboost import XGBClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
@@ -45,13 +56,24 @@ from sklearn.metrics import (
     classification_report,
 )
 
+from forecast_config import (
+    NON_FEATURE_COLS, CURRENT_LABEL_COL, FUTURE_LABEL_COL,
+    FORECAST_HORIZON_SECONDS,
+)
+from forecast_utils import (
+    naive_baseline_metrics, transition_report, upsert_comparison_report,
+    downcast_numeric_dtypes,
+)
+
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
 
 LABELED_DATA_PATH      = os.path.join("data", "processed", "labeled_dataset.csv")
-RF_MODEL_PATH          = os.path.join("models", "random_forest_model.pkl")
-XGB_MODEL_SAVE_PATH    = os.path.join("models", "xgboost_model.pkl")
+# Both renamed to the "_forecast_5s" convention — these models now target
+# degradation_risk_future, not the same-instant label (section 28).
+RF_MODEL_PATH          = os.path.join("models", "random_forest_forecast_5s.pkl")
+XGB_MODEL_SAVE_PATH    = os.path.join("models", "xgboost_forecast_5s.pkl")
 COMPARISON_REPORT_PATH = os.path.join("models", "comparison_report.json")
 
 # XGBoost hyperparameters
@@ -86,6 +108,11 @@ def load_data(path):
         )
 
     df = pd.read_csv(path, index_col="timestamp", parse_dates=True)
+
+    # Re-downcast — pandas.read_csv re-infers float64/int64 from the CSV
+    # text regardless of what dtypes were used when it was written.
+    df = downcast_numeric_dtypes(df)
+
     print(f"  Rows: {df.shape[0]}  Cols: {df.shape[1]}")
     return df
 
@@ -97,8 +124,12 @@ def load_data(path):
 def prepare_features_and_label(df):
     print_section("STEP 2 — Preparing features (X) and label (y)")
 
-    X = df.drop(columns=["degradation_score", "degradation_risk"])
-    y = df["degradation_risk"]
+    print(f"  Target column: '{FUTURE_LABEL_COL}' "
+          f"(degradation state ~{FORECAST_HORIZON_SECONDS}s ahead — NOT the same-instant label)")
+
+    columns_to_exclude = [c for c in NON_FEATURE_COLS if c in df.columns]
+    X = df.drop(columns=columns_to_exclude)
+    y = df[FUTURE_LABEL_COL]
 
     print(f"  Feature matrix X: {X.shape[0]} rows × {X.shape[1]} features")
     print(f"  Normal   (0): {(y == 0).sum()}")
@@ -274,7 +305,7 @@ def compare_models(xgb_metrics, rf_model_path, X_test, y_test):
         return xgb_metrics, None
 
     rf_model   = joblib.load(rf_model_path)
-    rf_metrics = evaluate_model(rf_model, X_test, y_test, "Random Forest")
+    rf_metrics = evaluate_model(rf_model, X_test, y_test, "Random Forest (5s forecast)")
 
     # Print the comparison table
     print_section("COMPARISON TABLE")
@@ -310,7 +341,7 @@ def compare_models(xgb_metrics, rf_model_path, X_test, y_test):
 # STEP 8 — Save model and comparison report
 # =============================================================================
 
-def save_outputs(model, xgb_metrics, rf_metrics):
+def save_outputs(model, xgb_metrics, rf_metrics, baseline_metrics=None):
     print_section("STEP 8 — Saving model and comparison report")
 
     # Save XGBoost model
@@ -319,16 +350,16 @@ def save_outputs(model, xgb_metrics, rf_metrics):
     print(f"  ✓ XGBoost model saved: {XGB_MODEL_SAVE_PATH}")
     print(f"    Size: {os.path.getsize(XGB_MODEL_SAVE_PATH)/1024:.1f} KB")
 
-    # Save JSON comparison report (read by the API for the dashboard)
-    report = {
-        "models": [
-            rf_metrics if rf_metrics else {},
-            xgb_metrics,
-        ]
-    }
-    with open(COMPARISON_REPORT_PATH, "w") as f:
-        json.dump(report, f, indent=2)
-    print(f"  ✓ Comparison report saved: {COMPARISON_REPORT_PATH}")
+    # Upsert into the shared comparison report instead of overwriting it —
+    # train_random_forest.py may have already written its own entry (and the
+    # naive baseline entry) to this same file; overwriting wholesale would
+    # silently delete them.
+    if baseline_metrics:
+        upsert_comparison_report(COMPARISON_REPORT_PATH, baseline_metrics)
+    if rf_metrics:
+        upsert_comparison_report(COMPARISON_REPORT_PATH, rf_metrics)
+    upsert_comparison_report(COMPARISON_REPORT_PATH, xgb_metrics)
+    print(f"  ✓ Comparison report updated: {COMPARISON_REPORT_PATH}")
 
 
 # =============================================================================
@@ -345,8 +376,20 @@ def main():
     X, y = prepare_features_and_label(df)
     X_train, X_test, y_train, y_test = split_data(X, y)
 
+    # Naive baseline on this same test split (recomputed here too so this
+    # script is runnable standalone, though train_random_forest.py already
+    # writes an identical entry since both scripts use the same split logic).
+    print_section("STEP 3b — Naive baseline on the held-out test set")
+    # IMPORTANT: positional (iloc), not X_test.index (loc) — see the matching
+    # comment in train_random_forest.py. Real multi-session data can have
+    # duplicate 'timestamp' values, and df.loc[X_test.index] would silently
+    # explode to every row sharing each duplicate label.
+    current_test = df[CURRENT_LABEL_COL].iloc[len(y_train):]
+    baseline_metrics = naive_baseline_metrics(current_test, y_test)
+
     xgb_model   = train_xgboost(X_train, y_train)
-    xgb_metrics = evaluate_model(xgb_model, X_test, y_test, "XGBoost")
+    xgb_metrics = evaluate_model(xgb_model, X_test, y_test, "XGBoost (5s forecast)")
+    transition_report(current_test, y_test, predicted_future=xgb_model.predict(X_test))
 
     print_feature_importances(xgb_model, list(X.columns))
 
@@ -354,13 +397,14 @@ def main():
         xgb_metrics, RF_MODEL_PATH, X_test, y_test
     )
 
-    save_outputs(xgb_model, xgb_metrics, rf_metrics)
+    save_outputs(xgb_model, xgb_metrics, rf_metrics, baseline_metrics)
 
     print("\n" + "=" * 65)
-    print("  ✓ XGBoost training complete!")
-    print(f"  XGBoost F1: {xgb_metrics['f1_score']}")
+    print("  ✓ XGBoost (5s forecast) training complete!")
+    print(f"  XGBoost  F1: {xgb_metrics['f1_score']}")
     if rf_metrics:
-        print(f"  RF      F1: {rf_metrics['f1_score']}")
+        print(f"  RF       F1: {rf_metrics['f1_score']}")
+    print(f"  Baseline F1: {baseline_metrics['f1_score']}")
     print(f"  Model saved: {XGB_MODEL_SAVE_PATH}")
     print("  Next step: Phase 5 — Connect both models to the dashboard.")
     print("=" * 65 + "\n")

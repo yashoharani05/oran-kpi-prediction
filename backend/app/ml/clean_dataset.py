@@ -23,6 +23,17 @@
 
 from pathlib import Path
 import pandas as pd
+
+# Enable pandas Copy-on-Write mode. Without this, pandas <3.0 defaults to
+# eagerly DEEP-COPYING the entire DataFrame inside routine calls like
+# rename()/drop()/set_index() (see pandas.core.generic._rename's internal
+# `self.copy(deep=copy and not using_copy_on_write())`). On a small sample
+# dataset that's invisible; on a real O-RAN recording with tens of millions
+# of rows, EVERY such call briefly allocates a full extra multi-GB copy and
+# can crash with numpy.core._exceptions._ArrayMemoryError. Copy-on-Write
+# makes these operations cheap (share memory until an actual write happens)
+# without changing any pipeline behaviour.
+pd.set_option("mode.copy_on_write", True)
 import numpy as np
 
 # =============================================================================
@@ -42,10 +53,6 @@ COMBINED_DATA_PATH = PROCESSED_DIR / "combined_dataset.csv"
 
 # Output 2: cleaned and ready for labelling
 CLEANED_DATA_PATH = PROCESSED_DIR / "cleaned_dataset.csv"
-
-# Number of rows processed at a time while validating and merging raw CSV files.
-# Lower this value if the machine still has limited RAM.
-CSV_CHUNK_SIZE = 250_000
 
 # =============================================================================
 # COLUMNS TO ALWAYS DROP — identity and experiment-config columns
@@ -103,28 +110,22 @@ def print_section(title):
 def load_and_validate_csv_files(raw_dir: Path):
     """
     Scan raw_dir for CSV files, validate each one, and return a list of
-    valid CSV paths ready to merge.
+    DataFrames ready to merge.
 
-    MEMORY-SAFE APPROACH:
-      - Each CSV is read in chunks instead of loading the whole file.
-      - Chunks are discarded immediately after validation.
-      - Only file paths are retained in memory.
-
-    Validation rules remain the same:
+    Validation rules:
       - Skip files that are empty (0 bytes or 0 rows)
       - Skip files that cannot be parsed as valid CSV
       - Skip files whose column set does not match the reference file
         (the first valid file sets the expected column list)
 
     Returns:
-        valid_files  — list of valid CSV Path objects
-        summary      — dict with counts for the final report
+        valid_frames  — list of DataFrames (one per valid file)
+        summary       — dict with counts for the final report
     """
     print_section("STEP 1 — Discovering and validating CSV files")
 
     # Find every .csv file in the raw folder (case-insensitive extension)
     all_csv_files = sorted(raw_dir.glob("*.csv")) + sorted(raw_dir.glob("*.CSV"))
-
     # Remove duplicates that might appear from both globs on case-sensitive filesystems
     seen = set()
     csv_files = []
@@ -142,59 +143,59 @@ def load_and_validate_csv_files(raw_dir: Path):
             "Please place your raw KPI CSV files in that folder and try again."
         )
 
-    valid_files = []            # Paths of files that passed all checks
+    valid_frames = []           # DataFrames that passed all checks
     skipped_files = []          # Files that were skipped and why
-    reference_columns = None    # Columns from the first valid file
+    reference_columns = None    # Columns from the first valid file (others must match)
     total_rows_before = 0       # Sum of rows across all valid files
 
     for csv_path in csv_files:
         print(f"\n  Checking: {csv_path.name}")
 
+        # ----------------------------------------------------------------
         # Check 1: File must not be empty (0 bytes)
+        # ----------------------------------------------------------------
         if csv_path.stat().st_size == 0:
             reason = "empty file (0 bytes)"
             print(f"    ⚠ SKIP — {reason}")
             skipped_files.append((csv_path.name, reason))
             continue
 
-        file_row_count = 0
-        file_columns = None
-
-        # Check 2 and 3: Parse the complete file in chunks and count rows.
-        # This preserves the original full-file validation without retaining
-        # the complete DataFrame in RAM.
+        # ----------------------------------------------------------------
+        # Check 2: File must be parseable as valid CSV
+        # ----------------------------------------------------------------
         try:
-            for chunk in pd.read_csv(
-                csv_path,
-                chunksize=CSV_CHUNK_SIZE,
-                low_memory=False
-            ):
-                if file_columns is None:
-                    file_columns = set(chunk.columns.tolist())
-                file_row_count += chunk.shape[0]
-
+            df = pd.read_csv(csv_path)
         except Exception as e:
             reason = f"could not parse CSV: {e}"
             print(f"    ⚠ SKIP — {reason}")
             skipped_files.append((csv_path.name, reason))
             continue
 
-        if file_row_count == 0:
+        # ----------------------------------------------------------------
+        # Check 3: File must have at least one data row (not just a header)
+        # ----------------------------------------------------------------
+        if df.shape[0] == 0:
             reason = "CSV has 0 data rows (header only)"
             print(f"    ⚠ SKIP — {reason}")
             skipped_files.append((csv_path.name, reason))
             continue
 
+        # ----------------------------------------------------------------
         # Check 4: Columns must match the reference file
+        # The first valid file sets the reference column list.
+        # Any subsequent file with different columns is skipped.
+        # ----------------------------------------------------------------
+        file_cols = set(df.columns.tolist())
+
         if reference_columns is None:
-            reference_columns = file_columns
-            print(
-                f"    ✓ OK — {file_row_count} rows, {len(file_columns)} cols "
-                f"(sets reference columns)"
-            )
+            # This is the first valid file — it sets the standard
+            reference_columns = file_cols
+            print(f"    ✓ OK — {df.shape[0]} rows, {df.shape[1]} cols "
+                  f"(sets reference columns)")
         else:
-            extra_cols = file_columns - reference_columns
-            missing_cols = reference_columns - file_columns
+            # Check that this file's columns match the reference
+            extra_cols  = file_cols - reference_columns
+            missing_cols = reference_columns - file_cols
 
             if extra_cols or missing_cols:
                 reason = (
@@ -205,15 +206,21 @@ def load_and_validate_csv_files(raw_dir: Path):
                 print(f"    ⚠ SKIP — {reason}")
                 skipped_files.append((csv_path.name, reason))
                 continue
+            else:
+                print(f"    ✓ OK — {df.shape[0]} rows, {df.shape[1]} cols")
 
-            print(f"    ✓ OK — {file_row_count} rows, {len(file_columns)} cols")
+        # File passed all checks — add a source column so we can trace rows
+        # back to their original file if needed
+        df["_source_file"] = csv_path.name
+        total_rows_before += df.shape[0]
+        valid_frames.append(df)
 
-        total_rows_before += file_row_count
-        valid_files.append(csv_path)
-
+    # ----------------------------------------------------------------
+    # Print validation summary
+    # ----------------------------------------------------------------
     print(f"\n  ── Validation Summary ──")
     print(f"  Files found:     {len(csv_files)}")
-    print(f"  Files loaded:    {len(valid_files)}")
+    print(f"  Files loaded:    {len(valid_frames)}")
     print(f"  Files skipped:   {len(skipped_files)}")
 
     if skipped_files:
@@ -221,84 +228,43 @@ def load_and_validate_csv_files(raw_dir: Path):
         for name, reason in skipped_files:
             print(f"    - {name}: {reason}")
 
-    if len(valid_files) == 0:
+    if len(valid_frames) == 0:
         raise ValueError(
             "\nERROR: No valid CSV files could be loaded.\n"
             "Check the warnings above and fix the files in data/raw/."
         )
 
     summary = {
-        "files_found": len(csv_files),
-        "files_processed": len(valid_files),
-        "files_skipped": len(skipped_files),
+        "files_found":     len(csv_files),
+        "files_processed": len(valid_frames),
+        "files_skipped":   len(skipped_files),
         "rows_before_merge": total_rows_before,
     }
 
-    return valid_files, summary
+    return valid_frames, summary
 
 
 # =============================================================================
 # STEP 2 — Merge all valid DataFrames into one
 # =============================================================================
 
-def merge_dataframes(valid_files, output_path: Path):
+def merge_dataframes(valid_frames):
     """
-    Merge all valid CSV files into one checkpoint CSV without holding every
-    source DataFrame in memory at the same time.
+    Stack all valid DataFrames on top of each other (row-wise concatenation).
 
-    Each input file is read in chunks and appended to combined_dataset.csv.
-    The internal _source_file column is still added exactly as before.
+    pd.concat with ignore_index=True creates a fresh 0..N integer index
+    for the combined DataFrame. We will replace this with the timestamp
+    later in the pipeline.
 
-    After the disk-based merge is complete, the combined CSV is read once so
-    the remaining cleaning steps can continue with the same DataFrame logic.
+    'sort=False' preserves the original column order from the first file.
     """
     print_section("STEP 2 — Merging all valid files")
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    combined = pd.concat(valid_frames, ignore_index=True, sort=False)
 
-    # Remove a previous checkpoint so repeated runs do not append duplicate data.
-    if output_path.exists():
-        output_path.unlink()
-
-    first_chunk = True
-    combined_rows = 0
-    combined_columns = 0
-
-    for file_number, csv_path in enumerate(valid_files, start=1):
-        print(f"  Merging [{file_number}/{len(valid_files)}]: {csv_path.name}")
-
-        for chunk in pd.read_csv(
-            csv_path,
-            chunksize=CSV_CHUNK_SIZE,
-            low_memory=False
-        ):
-            # Preserve the original source-tracking behaviour.
-            chunk["_source_file"] = csv_path.name
-
-            if combined_columns == 0:
-                combined_columns = chunk.shape[1]
-
-            chunk.to_csv(
-                output_path,
-                mode="w" if first_chunk else "a",
-                header=first_chunk,
-                index=False
-            )
-
-            combined_rows += chunk.shape[0]
-            first_chunk = False
-
-            # Explicitly release each chunk before reading the next one.
-            del chunk
-
-    print(f"\n  Files merged:  {len(valid_files)}")
-    print(f"  Combined rows: {combined_rows}")
-    print(f"  Columns:       {combined_columns}")
-    print(f"  Checkpoint:    {output_path}")
-
-    # Only one complete DataFrame is created here. Unlike pd.concat(valid_frames),
-    # there is no second full-sized copy of all source DataFrames in memory.
-    combined = pd.read_csv(output_path, low_memory=False)
+    print(f"  Files merged:  {len(valid_frames)}")
+    print(f"  Combined rows: {combined.shape[0]}")
+    print(f"  Columns:       {combined.shape[1]}")
 
     return combined
 
@@ -317,11 +283,7 @@ def save_combined(df, path: Path):
     print_section("STEP 3 — Saving raw combined dataset")
 
     path.parent.mkdir(parents=True, exist_ok=True)
-
-    # The memory-safe merge already created this checkpoint on disk.
-    # Avoid writing the same very large DataFrame a second time.
-    if not path.exists():
-        df.to_csv(path, index=False)
+    df.to_csv(path, index=False)
 
     print(f"  ✓ Saved: {path}")
     print(f"  Size:    {path.stat().st_size / 1024:.1f} KB")
@@ -355,19 +317,29 @@ def remove_empty_columns(df):
 
 
 # =============================================================================
-# STEP 5 — Remove the internal source-tracking column
+# STEP 5 — Rename the internal source-tracking column to session_id
 # =============================================================================
 
 def drop_source_column(df):
     """
-    Remove the _source_file column we added during validation.
+    Rename the _source_file column (added during validation) to 'session_id'.
 
-    We added it to trace which file each row came from.
-    It has served its purpose and should not be passed to the ML model.
+    METHODOLOGY NOTE (forecasting correction):
+    This column used to be DROPPED here. It is now KEPT and renamed, because
+    label_dataset.py needs it to shift the degradation label into the future
+    independently within each recording session — shifting across the
+    boundary between two different CSV files would silently mix unrelated
+    recordings and produce an invalid forecasting target.
+
+    'session_id' is excluded from the ML feature matrix in every training
+    script (see forecast_config.NON_FEATURE_COLS) and from the API payload,
+    so it does not change what the models are allowed to learn from — it is
+    metadata, not a feature.
     """
     if "_source_file" in df.columns:
-        df = df.drop(columns=["_source_file"])
-        print("\n  Dropped internal '_source_file' column.")
+        df = df.rename(columns={"_source_file": "session_id"})
+        print("\n  Renamed internal '_source_file' column to 'session_id' "
+              "(kept — needed for session-safe future-label shifting).")
     return df
 
 
@@ -423,7 +395,15 @@ def remove_zero_variance_columns(df):
     """
     print_section("STEP 6 — Removing zero-variance columns")
 
-    zero_var_cols = [col for col in df.columns if df[col].nunique() <= 1]
+    # 'session_id' is deliberately exempt: with only one raw CSV file present
+    # it will have exactly one unique value (nunique()==1) and would
+    # otherwise be dropped here — but it must survive to label_dataset.py
+    # regardless of how many sessions exist, so future-label shifting always
+    # has a session boundary to respect.
+    zero_var_cols = [
+        col for col in df.columns
+        if col != "session_id" and df[col].nunique() <= 1
+    ]
 
     if zero_var_cols:
         print(f"  Found {len(zero_var_cols)} zero-variance column(s):")
@@ -443,6 +423,69 @@ def remove_zero_variance_columns(df):
 # STEP 7 — Remove duplicate rows
 # =============================================================================
 
+def downcast_dtypes(df):
+    """
+    Downcast numeric columns to the smallest dtype that can represent them
+    without loss, and convert 'session_id' to a pandas categorical.
+
+    WHY THIS MATTERS AT SCALE:
+    pandas.read_csv defaults numeric columns to float64/int64 (8 bytes per
+    value). For a 24-million-row, ~30-column real O-RAN recording that is
+    several GB just for the numeric data — before accounting for the extra
+    headroom every later operation needs (drop_duplicates() hashing,
+    groupby(), sort_index(), model training, ...). Downcasting to float32/
+    the smallest sufficient int type roughly HALVES memory use for the rest
+    of the pipeline, with no change in the values themselves (KPI values
+    here — MCS 0-28, percentages 0-100, small PRB counts — are nowhere near
+    float32's ~7-significant-digit precision limit or int32's range).
+
+    'session_id' is a repeated string (one value per source file, e.g.
+    tens of thousands of rows sharing the same filename). Stored as plain
+    'object'/string dtype, that's very expensive at this row count; as a
+    pandas 'category' dtype, pandas stores each unique string ONCE and
+    every row as a small integer code — often a >90% memory reduction for
+    this specific column.
+
+    SAFETY: the still-raw Unix-millisecond timestamp column (named
+    'Timestamp' or 'timestamp' at this point in the pipeline, still a large
+    int64 — e.g. 1617070531726) is deliberately EXCLUDED from int
+    downcasting: that value is far larger than int32's ~2.1 billion range
+    and would silently overflow/corrupt if downcast. It is converted to
+    datetime64 by convert_data_types() later in the pipeline instead, which
+    is unaffected by this step (datetime64 columns are a different dtype
+    and are never selected here).
+    """
+    print_section("STEP 6b — Downcasting numeric dtypes (reduces memory ~50%)")
+
+    mem_before = df.memory_usage(deep=True).sum() / 1024**2
+    timestamp_cols = {c for c in df.columns if c.lower() == "timestamp"}
+
+    float_cols = [c for c in df.select_dtypes(include=["float64"]).columns if c not in timestamp_cols]
+    for col in float_cols:
+        df[col] = pd.to_numeric(df[col], downcast="float")
+
+    int_cols = [c for c in df.select_dtypes(include=["int64"]).columns if c not in timestamp_cols]
+    for col in int_cols:
+        # Signed downcast is safe for all our KPI columns (some, like
+        # sum_requested_prbs, are always >= 0, but signed 'integer' still
+        # downcasts to the smallest sufficient signed type — simpler and
+        # avoids any edge case with a stray negative value from a sensor glitch).
+        df[col] = pd.to_numeric(df[col], downcast="integer")
+
+    if "session_id" in df.columns:
+        df["session_id"] = df["session_id"].astype("category")
+
+    mem_after = df.memory_usage(deep=True).sum() / 1024**2
+    print(f"\n  Downcast {len(float_cols)} float64 → float32 column(s)")
+    print(f"  Downcast {len(int_cols)} int64 → smaller int column(s)")
+    if "session_id" in df.columns:
+        print(f"  Converted 'session_id' → category dtype")
+    print(f"  Memory: {mem_before:,.1f} MB → {mem_after:,.1f} MB "
+          f"({(1 - mem_after/mem_before)*100:.1f}% reduction)")
+
+    return df
+
+
 def remove_duplicates(df):
     """
     Remove rows that are exact duplicates of another row.
@@ -453,6 +496,13 @@ def remove_duplicates(df):
     those time periods and inflate training metrics.
 
     We keep the first occurrence and drop subsequent duplicates.
+
+    NOTE: now that 'session_id' is retained (see drop_source_column), a
+    duplicate is only detected when two rows from the SAME session are
+    byte-identical. Two different sessions that happen to record identical
+    KPI values are no longer treated as duplicates — which is correct: they
+    are two genuinely different measurements from two different times, not
+    an artefact of overlapping file exports.
     """
     print_section("STEP 7 — Removing duplicate rows")
 
@@ -844,10 +894,10 @@ def main():
     print("=" * 65)
 
     # Step 1: Discover and validate all CSV files
-    valid_files, summary = load_and_validate_csv_files(RAW_DATA_DIR)
+    valid_frames, summary = load_and_validate_csv_files(RAW_DATA_DIR)
 
     # Step 2: Merge all valid files into one DataFrame
-    df_combined = merge_dataframes(valid_files, COMBINED_DATA_PATH)
+    df_combined = merge_dataframes(valid_frames)
 
     # Step 3: Save raw combined data as a checkpoint
     save_combined(df_combined, COMBINED_DATA_PATH)
@@ -855,7 +905,12 @@ def main():
     # --- Cleaning pipeline on the combined data ---
 
     # Step 4: Drop columns that are entirely empty (all NaN)
-    df = remove_empty_columns(df_combined.copy())
+    # NOTE: no .copy() here — remove_empty_columns() already returns a new
+    # DataFrame (via .drop()), so an extra .copy() would momentarily hold
+    # TWO full copies of the combined dataset in memory at once. On a small
+    # sample dataset that's harmless; on a large real recording (tens of
+    # millions of rows) it can exhaust available RAM. Not needed either way.
+    df = remove_empty_columns(df_combined)
 
     # Step 5: Remove the internal source-file tracking column
     df = drop_source_column(df)
@@ -868,6 +923,11 @@ def main():
 
     # Step 6: Drop any remaining columns with only one unique value
     df = remove_zero_variance_columns(df)
+
+    # Step 6b: Downcast numeric dtypes BEFORE the expensive steps below —
+    # halves memory use for remove_duplicates()'s row-hashing, rename,
+    # missing-value handling, feature engineering, and sort_index().
+    df = downcast_dtypes(df)
 
     # Step 7: Remove duplicate rows (can occur when sessions overlap)
     df = remove_duplicates(df)
